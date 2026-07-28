@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>LangChain Agent</title>
+  </head>
+  <body>
+    <p>本示例在 Node.js 中运行，请在终端执行：</p>
+    <pre>npm start</pre>
+  </body>
+  <script>
+    fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        // 必须用 OpenRouter 的 key（sk-or-...），不能用 OpenAI 的 sk-proj-...
+        // 切勿把真实 key 写进前端；仅本地调试可临时替换下方占位符
+        Authorization: "Bearer <OPENROUTER_API_KEY>",
+        "HTTP-Referer": "http://localhost",
+        "X-OpenRouter-Title": "LangChain Demo",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "~openai/gpt-latest",
+        messages: [
+          {
+            role: "user",
+            content: "What is the meaning of life?",
+          },
+        ],
+      }),
+    })
+      .then((response) => response.json())
+      .then((data) => {
+        console.log(data);
+      });
+  </script>
+</html>
