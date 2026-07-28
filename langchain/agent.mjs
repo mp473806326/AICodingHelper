@@ -17,6 +17,8 @@ import {
   redoLastUndone,
   getChangeStatus,
   clearChangeHistory,
+  getWorkspaceRoot,
+  setWorkspaceRoot,
 } from "./tools/fs.js";
 
 /** 按需创建并缓存 agent，缺少 API Key 的模型不在启动时强制初始化 */
@@ -92,6 +94,27 @@ app.get("/models", (_req, res) => {
     name: config.name,
   }));
   res.json({ models });
+});
+
+/** 获取当前工作区目录 */
+app.get("/workspace", (_req, res) => {
+  res.json({ workspaceRoot: getWorkspaceRoot() });
+});
+
+/** 设置工作区目录（后端将在此目录内读写文件） */
+app.post("/workspace", async (req, res) => {
+  try {
+    const { path: dirPath } = req.body ?? {};
+    if (!dirPath || typeof dirPath !== "string") {
+      return res.status(400).json({ error: "请提供 path 字符串参数（绝对路径目录）" });
+    }
+    const workspaceRoot = await setWorkspaceRoot(dirPath);
+    // 工作区变更后清空 agent 缓存，以便重新注入系统提示中的根目录
+    agentCache.clear();
+    res.json({ success: true, workspaceRoot });
+  } catch (err) {
+    res.status(400).json({ error: err.message ?? "设置工作区失败" });
+  }
 });
 
 app.post("/chat", async (req, res) => {
@@ -186,8 +209,11 @@ app.post("/file-changes/clear", (_req, res) => {
 const PORT = process.env.PORT || 3000;
 const server = app.listen(PORT, () => {
   console.log(`服务已启动: http://localhost:${PORT}`);
+  console.log(`工作区: ${getWorkspaceRoot()}`);
   console.log(`POST /chat  body: { "message": "东京天气如何？", "model": "deepseek" }`);
   console.log(`GET  /models`);
+  console.log(`GET  /workspace`);
+  console.log(`POST /workspace  body: { "path": "D:\\\\path\\\\to\\\\project" }`);
   console.log(`GET  /file-changes/status`);
   console.log(`POST /file-changes/undo`);
   console.log(`POST /file-changes/redo`);

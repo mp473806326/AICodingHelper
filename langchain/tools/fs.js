@@ -7,9 +7,41 @@ import * as z from "zod";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 /** Default: project root (parent of langchain/) */
-export const WORKSPACE_ROOT = path.resolve(
+let workspaceRoot = path.resolve(
   process.env.WORKSPACE_ROOT || path.join(__dirname, "..", ".."),
 );
+
+/** @deprecated 请优先使用 getWorkspaceRoot()；导出为兼容旧引用的可变绑定 */
+export let WORKSPACE_ROOT = workspaceRoot;
+
+export function getWorkspaceRoot() {
+  return workspaceRoot;
+}
+
+/**
+ * 设置工作区根目录（须为已存在的绝对路径目录）
+ * @param {string} dirPath
+ * @returns {Promise<string>} 规范化后的绝对路径
+ */
+export async function setWorkspaceRoot(dirPath) {
+  if (!dirPath || typeof dirPath !== "string") {
+    throw new Error("请提供有效的目录路径");
+  }
+  const resolved = path.resolve(dirPath.trim());
+  let stat;
+  try {
+    stat = await fs.stat(resolved);
+  } catch {
+    throw new Error(`目录不存在: ${resolved}`);
+  }
+  if (!stat.isDirectory()) {
+    throw new Error(`路径不是目录: ${resolved}`);
+  }
+  workspaceRoot = resolved;
+  WORKSPACE_ROOT = resolved;
+  clearChangeHistory();
+  return workspaceRoot;
+}
 
 function resolveSafePath(relativePath) {
   if (!relativePath || typeof relativePath !== "string") {
@@ -19,14 +51,25 @@ function resolveSafePath(relativePath) {
   if (path.isAbsolute(relativePath) || /^[a-zA-Z]:/.test(relativePath)) {
     throw new Error("请使用相对工作区的路径，不要使用绝对路径");
   }
-  const resolved = path.resolve(WORKSPACE_ROOT, normalized);
-  const rootWithSep = WORKSPACE_ROOT.endsWith(path.sep)
-    ? WORKSPACE_ROOT
-    : WORKSPACE_ROOT + path.sep;
-  if (resolved !== WORKSPACE_ROOT && !resolved.startsWith(rootWithSep)) {
+  const root = workspaceRoot;
+  const resolved = path.resolve(root, normalized);
+  const rootWithSep = root.endsWith(path.sep) ? root : root + path.sep;
+  if (resolved !== root && !resolved.startsWith(rootWithSep)) {
     throw new Error(`路径超出工作区范围: ${relativePath}`);
   }
   return resolved;
+}
+
+/** 编程助手系统提示（随当前工作区动态生成） */
+export function getCodingSystemPrompt() {
+  return `你是一个能操作本地文件的编程助手。
+工作区根目录: ${workspaceRoot}
+你可以用工具 list_dir / read_file / write_file 浏览、读取、创建或修改工作区内的文件。
+路径一律使用相对于工作区根目录的相对路径（例如 src/App.vue）。
+修改文件前先 read_file 确认现状；写入时提供完整文件内容。
+write_file 成功后不要再反复 read_file 校验，直接用文字总结改动并结束。
+每个文件只写入一次；不要对同一文件重复 write_file。
+不要尝试访问工作区外的路径。`;
 }
 
 /* ========== 文件更改历史管理 ========== */
@@ -170,7 +213,7 @@ export const listDir = tool(
       .sort((a, b) => a.name.localeCompare(b.name))
       .map((e) => `${e.isDirectory() ? "[dir] " : "[file]"} ${e.name}`);
     return lines.length
-      ? `工作区: ${WORKSPACE_ROOT}\n目录: ${dir_path || "."}\n${lines.join("\n")}`
+      ? `工作区: ${workspaceRoot}\n目录: ${dir_path || "."}\n${lines.join("\n")}`
       : `(空目录) ${dir_path || "."}`;
   },
   {

@@ -22,7 +22,7 @@ import { ChatOpenAI } from "@langchain/openai";
 import { createAgent } from "langchain";
 import { tool } from "langchain";
 import * as z from "zod";
-import { WORKSPACE_ROOT, fileTools } from "../tools/fs.js";
+import { getCodingSystemPrompt, fileTools } from "../tools/fs.js";
 
 /** Agent Plan OpenAI 兼容 endpoint（ark-code-latest 仅在此或 Coding Plan 端点可用） */
 const DOUBAO_BASE_URL =
@@ -52,14 +52,56 @@ function assertDoubaoApiKey() {
   }
 }
 
-const SYSTEM_PROMPT = `你是一个能操作本地文件的编程助手。
-工作区根目录: ${WORKSPACE_ROOT}
-你可以用工具 list_dir / read_file / write_file 浏览、读取、创建或修改工作区内的文件。
-路径一律使用相对于工作区根目录的相对路径（例如 front/src/App.vue）。
-修改文件前先 read_file 确认现状；写入时提供完整文件内容。
-write_file 成功后不要再反复 read_file 校验，直接用文字总结改动并结束。
-每个文件只写入一次；不要对同一文件重复 write_file。
-不要尝试访问工作区外的路径。`;
+/**
+ * 豆包 Agent Plan 常对无参/可选参工具返回 arguments: ""，
+ * LangChain 的 JSON.parse("") 会失败，工具调用变成 invalid_tool_calls，
+ * agent 直接空回复结束（表现为「改代码没反应」）。
+ * 在进入 LangChain 解析前把空 arguments 归一成 "{}"。
+ */
+function normalizeToolCallArguments(payload) {
+  if (!payload || typeof payload !== "object") return payload;
+  for (const choice of payload.choices ?? []) {
+    const toolCalls = choice?.message?.tool_calls;
+    if (!Array.isArray(toolCalls)) continue;
+    for (const tc of toolCalls) {
+      if (!tc?.function) continue;
+      const args = tc.function.arguments;
+      if (args == null || args === "") {
+        tc.function.arguments = "{}";
+      }
+    }
+  }
+  return payload;
+}
+
+/** OpenAI SDK 兼容 fetch：修补豆包空 tool arguments */
+async function doubaoFetch(url, init) {
+  const response = await fetch(url, init);
+  const contentType = response.headers.get("content-type") || "";
+  if (!contentType.includes("application/json")) {
+    return response;
+  }
+
+  const raw = await response.text();
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    return new Response(raw, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    });
+  }
+
+  normalizeToolCallArguments(data);
+
+  return new Response(JSON.stringify(data), {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
+}
 
 /** 创建一个由豆包（Doubao）驱动的 LangChain Agent */
 export function createDoubaoAgent() {
@@ -71,13 +113,14 @@ export function createDoubaoAgent() {
     apiKey: process.env.DOUBAO_API_KEY || process.env.ARK_API_KEY,
     configuration: {
       baseURL: DOUBAO_BASE_URL,
+      fetch: doubaoFetch,
     },
   });
 
   return createAgent({
     model,
     tools: [getWeather, ...fileTools],
-    systemPrompt: SYSTEM_PROMPT,
+    systemPrompt: getCodingSystemPrompt(),
   });
 }
 

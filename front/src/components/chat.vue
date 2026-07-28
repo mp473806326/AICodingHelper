@@ -33,6 +33,7 @@ interface FileChangeStatus {
 
 const STORAGE_KEY = 'ai-chat-messages'
 const MODEL_STORAGE_KEY = 'ai-chat-selected-model'
+const WORKSPACE_STORAGE_KEY = 'ai-chat-workspace'
 
 function loadMessages(): Message[] {
   try {
@@ -106,6 +107,52 @@ async function confirmFileChanges() {
 const models = ref<ModelOption[]>([])
 const selectedModel = ref('')
 
+/* ---------- 工作区目录 ---------- */
+const workspacePath = ref('')
+const workspaceLoading = ref(false)
+const workspaceError = ref('')
+const workspaceSaved = ref(false)
+
+/** 从后端加载当前工作区 */
+async function loadWorkspace() {
+  try {
+    const { data } = await axios.get<{ workspaceRoot: string }>('/api/workspace')
+    workspacePath.value = data.workspaceRoot
+    sessionStorage.setItem(WORKSPACE_STORAGE_KEY, data.workspaceRoot)
+  } catch {
+    const saved = sessionStorage.getItem(WORKSPACE_STORAGE_KEY)
+    if (saved) workspacePath.value = saved
+  }
+}
+
+/** 将所选目录同步到后端 */
+async function applyWorkspace() {
+  const path = workspacePath.value.trim()
+  if (!path || workspaceLoading.value) return
+  workspaceLoading.value = true
+  workspaceError.value = ''
+  workspaceSaved.value = false
+  try {
+    const { data } = await axios.post<{ success: boolean; workspaceRoot: string }>(
+      '/api/workspace',
+      { path },
+    )
+    workspacePath.value = data.workspaceRoot
+    sessionStorage.setItem(WORKSPACE_STORAGE_KEY, data.workspaceRoot)
+    workspaceSaved.value = true
+    setTimeout(() => {
+      workspaceSaved.value = false
+    }, 1500)
+    await refreshFileChangeStatus()
+  } catch (err) {
+    workspaceError.value = axios.isAxiosError(err)
+      ? (err.response?.data as { error?: string })?.error || err.message
+      : '设置工作区失败'
+  } finally {
+    workspaceLoading.value = false
+  }
+}
+
 /** 从后端加载可用模型列表 */
 async function loadModels() {
   try {
@@ -143,6 +190,7 @@ watch(selectedModel, (val) => {
 
 onMounted(() => {
   loadModels()
+  loadWorkspace()
   refreshFileChangeStatus()
 })
 
@@ -229,10 +277,16 @@ async function copyMessage(content: string, index: number) {
   }
 }
 
-/** 清空所有聊天消息 */
-function clearMessages() {
-  if (messages.value.length === 0) return
+/** 清空所有聊天消息，并同步清空后端文件修改记录 */
+async function clearMessages() {
+  if (messages.value.length === 0 && !showFileActions.value) return
   messages.value = []
+  try {
+    await axios.post('/api/file-changes/clear')
+    await refreshFileChangeStatus()
+  } catch {
+    // 后端清空失败不影响前端消息清空
+  }
 }
 </script>
 
@@ -247,7 +301,7 @@ function clearMessages() {
           <button
             class="clear-btn"
             type="button"
-            :disabled="!messages.length"
+            :disabled="!messages.length && !showFileActions"
             @click="clearMessages"
           >
             清空内容
@@ -267,6 +321,28 @@ function clearMessages() {
           </div>
         </div>
       </div>
+      <!-- 工作区目录 -->
+      <div class="workspace-row">
+        <label for="workspace-input">工作区：</label>
+        <input
+          id="workspace-input"
+          v-model="workspacePath"
+          type="text"
+          class="workspace-input"
+          placeholder="输入本机绝对路径，例如 D:\work\myProject"
+          :disabled="workspaceLoading || loading"
+          @keydown.enter.prevent="applyWorkspace"
+        />
+        <button
+          type="button"
+          class="workspace-btn"
+          :disabled="workspaceLoading || loading || !workspacePath.trim()"
+          @click="applyWorkspace"
+        >
+          {{ workspaceLoading ? '设置中…' : workspaceSaved ? '已设置' : '应用' }}
+        </button>
+      </div>
+      <p v-if="workspaceError" class="workspace-error">{{ workspaceError }}</p>
     </header>
 
     <div ref="listRef" class="chat-list">
@@ -464,6 +540,70 @@ function clearMessages() {
 .model-selector select:disabled {
   opacity: 0.6;
   cursor: not-allowed;
+}
+
+/* 工作区目录选择 */
+.workspace-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  font-size: 13px;
+  color: var(--text);
+}
+
+.workspace-row label {
+  flex-shrink: 0;
+}
+
+.workspace-input {
+  flex: 1;
+  min-width: 0;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--text-h);
+  font: inherit;
+  font-size: 13px;
+  outline: none;
+}
+
+.workspace-input:focus {
+  border-color: var(--accent);
+}
+
+.workspace-input:disabled {
+  opacity: 0.6;
+}
+
+.workspace-btn {
+  flex-shrink: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 4px 12px;
+  background: transparent;
+  color: var(--text-h);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  transition: border-color 0.2s, color 0.2s, background 0.2s;
+}
+
+.workspace-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.workspace-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.workspace-error {
+  margin: 6px 0 0;
+  font-size: 12px;
+  color: #e53e3e;
 }
 
 .chat-list {
