@@ -24,6 +24,13 @@ interface ModelOption {
   name: string
 }
 
+interface FileChangeStatus {
+  hasChanges: boolean
+  canUndo: boolean
+  canRedo: boolean
+  changes: { filePath: string }[]
+}
+
 const STORAGE_KEY = 'ai-chat-messages'
 const MODEL_STORAGE_KEY = 'ai-chat-selected-model'
 
@@ -43,6 +50,57 @@ const input = ref('')
 const loading = ref(false)
 const listRef = ref<HTMLElement | null>(null)
 const copiedIndex = ref<number | null>(null)
+
+/* ---------- 文件更改确认/取消 ---------- */
+const canUndo = ref(false)
+const canRedo = ref(false)
+const changeActionLoading = ref(false)
+const showFileActions = ref(false)
+
+async function refreshFileChangeStatus() {
+  try {
+    const { data } = await axios.get<FileChangeStatus>('/api/file-changes/status')
+    canUndo.value = data.canUndo
+    canRedo.value = data.canRedo
+    showFileActions.value = data.hasChanges
+  } catch {
+    // 状态获取失败时不展示按钮
+  }
+}
+
+/** 取消：撤销文件更改 */
+async function cancelFileChanges() {
+  if (!canUndo.value || changeActionLoading.value) return
+  changeActionLoading.value = true
+  try {
+    await axios.post('/api/file-changes/undo')
+    await refreshFileChangeStatus()
+  } catch (err) {
+    const msg = axios.isAxiosError(err)
+      ? (err.response?.data as { error?: string })?.error || err.message
+      : '撤销失败'
+    messages.value.push({ role: 'ai', content: `撤销更改失败：${msg}` })
+  } finally {
+    changeActionLoading.value = false
+  }
+}
+
+/** 确定：重新应用文件更改 */
+async function confirmFileChanges() {
+  if (!canRedo.value || changeActionLoading.value) return
+  changeActionLoading.value = true
+  try {
+    await axios.post('/api/file-changes/redo')
+    await refreshFileChangeStatus()
+  } catch (err) {
+    const msg = axios.isAxiosError(err)
+      ? (err.response?.data as { error?: string })?.error || err.message
+      : '重新更改失败'
+    messages.value.push({ role: 'ai', content: `重新更改失败：${msg}` })
+  } finally {
+    changeActionLoading.value = false
+  }
+}
 
 /* ---------- 模型选择 ---------- */
 const models = ref<ModelOption[]>([])
@@ -65,6 +123,15 @@ async function loadModels() {
     models.value = [
       { id: 'deepseek', name: 'DeepSeek' },
       { id: 'openai', name: 'OpenAI' },
+      { id: 'tongyiqwen', name: '通义千问' },
+      { id: 'doubao', name: '豆包' },
+      { id: 'ai21', name: 'AI21' },
+      { id: 'anthropic', name: 'Anthropic' },
+      { id: 'baiduqianfan', name: 'Baidu Qianfan' },
+      { id: 'googlegemini', name: 'Google Gemini' },
+      { id: 'chatwriter', name: 'ChatWriter' },
+      { id: 'azureopenai', name: 'Azure OpenAI' },
+      { id: 'chatollama', name: 'ChatOllama' },
     ]
     selectedModel.value = 'deepseek'
   }
@@ -74,7 +141,10 @@ watch(selectedModel, (val) => {
   if (val) sessionStorage.setItem(MODEL_STORAGE_KEY, val)
 })
 
-onMounted(loadModels)
+onMounted(() => {
+  loadModels()
+  refreshFileChangeStatus()
+})
 
 /* ---------- 消息列表 ---------- */
 watch(
@@ -124,6 +194,7 @@ async function send() {
         content: formatAiContent(data.reply || '', data.toolResults),
       })
     }
+    await refreshFileChangeStatus()
   } catch (err) {
     const msg = axios.isAxiosError(err)
       ? (err.response?.data as { error?: string })?.error || err.message
@@ -230,11 +301,32 @@ function clearMessages() {
       />
       <button type="submit" :disabled="loading || !input.trim()">发送</button>
     </form>
+
+    <!-- 文件更改：确定 / 取消（右下角） -->
+    <div v-if="showFileActions" class="file-actions">
+      <button
+        type="button"
+        class="file-btn cancel"
+        :disabled="!canUndo || changeActionLoading"
+        @click="cancelFileChanges"
+      >
+        取消
+      </button>
+      <button
+        type="button"
+        class="file-btn confirm"
+        :disabled="!canRedo || changeActionLoading"
+        @click="confirmFileChanges"
+      >
+        确定
+      </button>
+    </div>
   </div>
 </template>
 
 <style scoped>
 .chat {
+  position: relative;
   display: flex;
   flex-direction: column;
   height: 100svh;
@@ -243,6 +335,49 @@ function clearMessages() {
   width: 100%;
   box-sizing: border-box;
   text-align: left;
+}
+
+/* 文件更改确认/取消按钮 */
+.file-actions {
+  position: absolute;
+  right: 20px;
+  bottom: 76px;
+  display: flex;
+  gap: 8px;
+  z-index: 10;
+}
+
+.file-btn {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 14px;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  background: var(--bg);
+  color: var(--text-h);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+  transition: border-color 0.2s, color 0.2s, opacity 0.2s;
+}
+
+.file-btn.confirm {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.file-btn.cancel:hover:not(:disabled) {
+  border-color: #e53e3e;
+  color: #e53e3e;
+}
+
+.file-btn.confirm:hover:not(:disabled) {
+  opacity: 0.9;
+}
+
+.file-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 .chat-header {

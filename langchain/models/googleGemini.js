@@ -1,11 +1,26 @@
+/**
+ * Google Gemini 模型接入
+ *
+ * 依赖 @langchain/google-genai。
+ *
+ * 在 .env 中配置：
+ *   GOOGLE_API_KEY=你的 Google AI Studio API Key
+ *
+ * API Key 获取：https://aistudio.google.com/apikey
+ */
+
 import "dotenv/config";
-import { ChatOpenAI } from "@langchain/openai";
+import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
 import { createAgent } from "langchain";
 import { tool } from "langchain";
 import * as z from "zod";
 import { WORKSPACE_ROOT, fileTools } from "../tools/fs.js";
 
-const DEFAULT_OPENAI_MODEL = "gpt-4o";
+/** 默认使用的 Gemini 模型
+ * 可选值：gemini-2.5-flash, gemini-2.5-pro, gemini-2.0-flash 等
+ * 详见 https://ai.google.dev/gemini-api/docs/models
+ */
+const DEFAULT_GEMINI_MODEL = "gemini-2.5-flash";
 
 const getWeather = tool(
   ({ city }) => `${city} 天气总是晴朗！`,
@@ -18,9 +33,9 @@ const getWeather = tool(
   },
 );
 
-function assertOpenaiApiKey() {
-  if (!process.env.OPENAI_API_KEY) {
-    throw new Error("请在 .env 中设置 OPENAI_API_KEY");
+function assertGoogleApiKey() {
+  if (!process.env.GOOGLE_API_KEY) {
+    throw new Error("请在 .env 中设置 GOOGLE_API_KEY（Google AI Studio API Key）");
   }
 }
 
@@ -33,14 +48,14 @@ write_file 成功后不要再反复 read_file 校验，直接用文字总结改�
 每个文件只写入一次；不要对同一文件重复 write_file。
 不要尝试访问工作区外的路径。`;
 
-/** 创建一个由 OpenAI 驱动的 LangChain Agent */
-export function createOpenaiAgent() {
-  assertOpenaiApiKey();
+/** 创建一个由 Google Gemini 驱动的 LangChain Agent */
+export function createGoogleGeminiAgent() {
+  assertGoogleApiKey();
 
-  const model = new ChatOpenAI({
-    model: DEFAULT_OPENAI_MODEL,
+  const model = new ChatGoogleGenerativeAI({
+    model: DEFAULT_GEMINI_MODEL,
     temperature: 0,
-    apiKey: process.env.OPENAI_API_KEY,
+    apiKey: process.env.GOOGLE_API_KEY,
   });
 
   return createAgent({
@@ -50,8 +65,7 @@ export function createOpenaiAgent() {
   });
 }
 
-export const agent = createOpenaiAgent();
-export const openai = {
-  DEFAULT_OPENAI_MODEL,
-  createOpenaiAgent,
+export const googleGemini = {
+  DEFAULT_GEMINI_MODEL,
+  createGoogleGeminiAgent,
 };

@@ -2,11 +2,17 @@
   "name": "langchain",
   "type": "module",
   "scripts": {
-    "start": "node agent.mjs"
+    "start": "node agent.mjs",
+    "stop": "node scripts/stop.mjs",
+    "restart": "node scripts/stop.mjs && node agent.mjs"
   },
+
   "dependencies": {
+    "@langchain/anthropic": "^1.5.2",
+    "@langchain/baidu-qianfan": "^1.0.3",
     "@langchain/core": "^1.2.3",
     "@langchain/deepseek": "^1.1.5",
+    "@langchain/google-genai": "^2.2.0",
     "@langchain/ollama": "^1.3.0",
     "@langchain/openai": "^1.5.5",
     "dotenv": "^17.4.2",
