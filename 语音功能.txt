@@ -1,0 +1,679 @@
+
+
+# 狼人杀TTS语音集成 - AI实现文档 (v1.0)
+
+## 📋 文档目标
+基于现有的Vue 3前端 + Node.js后端项目架构，集成文本转语音（TTS）功能，将AI生成的狼人杀对局文本转换为语音，提升用户体验。
+
+---
+
+## 🏗️ 技术架构概览
+
+### 项目结构
+```
+project/
+├── frontend/               # Vue 3 项目
+│   ├── src/
+│   │   ├── components/
+│   │   │   └── AudioPlayer.vue    # 音频播放组件
+│   │   ├── services/
+│   │   │   └── ttsService.ts      # TTS API调用服务
+│   │   └── views/
+│   │       └── GameView.vue       # 游戏主界面
+│   └── package.json
+├── backend/                # Node.js 项目
+│   ├── src/
+│   │   ├── controllers/
+│   │   │   └── ttsController.js   # TTS控制器
+│   │   ├── services/
+│   │   │   └── ttsService.js      # TTS核心服务
+│   │   └── routes/
+│   │       └── ttsRoutes.js       # TTS路由
+│   └── package.json
+```
+
+---
+
+## 🔧 后端实现 (Node.js)
+
+### 1. 安装依赖
+```bash
+cd backend
+npm install @travisvn/edge-tts express cors
+```
+
+### 2. TTS核心服务 (backend/src/services/ttsService.js)
+```javascript
+import { Communicate } from '@travisvn/edge-tts';
+
+// 音色配置
+const VOICE_CONFIG = {
+    // 女声：晓晓（适合法官、女巫等角色）
+    female: 'zh-CN-XiaoxiaoNeural',
+    // 男声：云扬（适合狼人、预言家等角色）
+    male: 'zh-CN-YunyangNeural',
+    // 年轻男声：云希（适合平民、新手玩家）
+    youngMale: 'zh-CN-YunxiNeural',
+};
+
+// 语速配置 (默认1.0)
+const SPEED_CONFIG = {
+    normal: 1.0,
+    slow: 0.8,    // 适合重要信息
+    fast: 1.2,    // 适合紧张场景
+};
+
+class TTSService {
+    /**
+     * 将文本转换为音频流
+     * @param {string} text - 要转换的文本
+     * @param {string} voice - 音色标识 (female/male/youngMale)
+     * @param {number} speed - 语速 (0.5-2.0)
+     * @returns {AsyncGenerator} 音频数据流
+     */
+    async textToStream(text, voice = 'female', speed = 1.0) {
+        try {
+            const voiceName = VOICE_CONFIG[voice] || VOICE_CONFIG.female;
+            
+            // 构建SSML以控制语速和停顿
+            const ssml = `
+                <speak xmlns="http://www.w3.org/2001/10/synthesis" 
+                       xml:lang="zh-CN">
+                    <prosody rate="${speed}">
+                        ${text}
+                    </prosody>
+                </speak>
+            `;
+            
+            const communicate = new Communicate(ssml, { 
+                voice: voiceName,
+                outputFormat: 'audio-24khz-48kbitrate-mono-mp3'
+            });
+            
+            return communicate.stream();
+        } catch (error) {
+            console.error('TTS转换失败:', error);
+            throw new Error('语音合成服务暂时不可用');
+        }
+    }
+
+    /**
+     * 批量转换：将多段文本按角色语音合成
+     * @param {Array} segments - [{text, voice}]
+     * @returns {Promise<Buffer>} 合并后的音频Buffer
+     */
+    async batchTextToAudio(segments) {
+        const audioBuffers = [];
+        
+        for (const segment of segments) {
+            const stream = await this.textToStream(segment.text, segment.voice);
+            const chunks = [];
+            
+            for await (const chunk of stream) {
+                if (chunk.type === 'audio' && chunk.data) {
+                    chunks.push(chunk.data);
+                }
+            }
+            
+            audioBuffers.push(Buffer.concat(chunks));
+        }
+        
+        // 合并所有音频片段
+        return Buffer.concat(audioBuffers);
+    }
+}
+
+export default new TTSService();
+```
+
+### 3. TTS控制器 (backend/src/controllers/ttsController.js)
+```javascript
+import ttsService from '../services/ttsService.js';
+
+export const ttsController = {
+    /**
+     * 流式返回音频（推荐：边生成边播放）
+     */
+    async streamAudio(req, res) {
+        try {
+            const { text, voice = 'female', speed = 1.0 } = req.body;
+            
+            if (!text) {
+                return res.status(400).json({ error: '缺少文本参数' });
+            }
+
+            // 设置响应头
+            res.setHeader('Content-Type', 'audio/mpeg');
+            res.setHeader('Transfer-Encoding', 'chunked');
+            res.setHeader('Cache-Control', 'no-cache');
+
+            const stream = await ttsService.textToStream(text, voice, speed);
+            
+            // 流式写入响应
+            for await (const chunk of stream) {
+                if (chunk.type === 'audio' && chunk.data) {
+                    res.write(chunk.data);
+                }
+            }
+            
+            res.end();
+        } catch (error) {
+            console.error('流式音频生成失败:', error);
+            if (!res.headersSent) {
+                res.status(500).json({ error: '语音生成失败' });
+            } else {
+                res.end();
+            }
+        }
+    },
+
+    /**
+     * 批量生成音频（适合完整对局）
+     */
+    async batchAudio(req, res) {
+        try {
+            const { segments } = req.body; // [{text, voice}]
+            
+            if (!segments || !Array.isArray(segments) || segments.length === 0) {
+                return res.status(400).json({ error: '缺少语音片段数据' });
+            }
+
+            const audioBuffer = await ttsService.batchTextToAudio(segments);
+            
+            res.setHeader('Content-Type', 'audio/mpeg');
+            res.send(audioBuffer);
+        } catch (error) {
+            console.error('批量音频生成失败:', error);
+            res.status(500).json({ error: '批量语音生成失败' });
+        }
+    }
+};
+```
+
+### 4. TTS路由 (backend/src/routes/ttsRoutes.js)
+```javascript
+import express from 'express';
+import { ttsController } from '../controllers/ttsController.js';
+
+const router = express.Router();
+
+// 流式音频接口（推荐）
+router.post('/tts/stream', ttsController.streamAudio);
+
+// 批量音频接口（完整对局用）
+router.post('/tts/batch', ttsController.batchAudio);
+
+export default router;
+```
+
+### 5. 应用入口集成 (backend/src/app.js)
+```javascript
+import express from 'express';
+import cors from 'cors';
+import ttsRoutes from './routes/ttsRoutes.js';
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.use(cors());
+app.use(express.json({ limit: '10mb' }));
+app.use('/api', ttsRoutes);
+
+app.listen(PORT, () => {
+    console.log(`TTS服务已启动: http://localhost:${PORT}`);
+});
+```
+
+---
+
+## 🎨 前端实现 (Vue 3)
+
+### 1. TTS服务 (frontend/src/services/ttsService.ts)
+```typescript
+// TTS API调用服务
+const API_BASE = 'http://localhost:3000/api';
+
+interface TTSOptions {
+    voice?: 'female' | 'male' | 'youngMale';
+    speed?: number;
+}
+
+export class TTSService {
+    private audioContext: AudioContext | null = null;
+    private currentSource: AudioBufferSourceNode | null = null;
+
+    /**
+     * 流式播放语音（边生成边播放）
+     */
+    async playStream(text: string, options: TTSOptions = {}) {
+        const { voice = 'female', speed = 1.0 } = options;
+        
+        try {
+            const response = await fetch(`${API_BASE}/tts/stream`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ text, voice, speed })
+            });
+
+            if (!response.ok) {
+                throw new Error('语音生成失败');
+            }
+
+            // 获取音频数据
+            const audioData = await response.arrayBuffer();
+            
+            // 使用AudioContext播放
+            if (!this.audioContext) {
+                this.audioContext = new AudioContext();
+            }
+            
+            // 解码并播放
+            const audioBuffer = await this.audioContext.decodeAudioData(audioData);
+            const source = this.audioContext.createBufferSource();
+            source.buffer = audioBuffer;
+            source.connect(this.audioContext.destination);
+            source.start();
+            
+            this.currentSource = source;
+            return source;
+        } catch (error) {
+            console.error('播放失败:', error);
+            throw error;
+        }
+    }
+
+    /**
+     * 停止播放
+     */
+    stopPlay() {
+        if (this.currentSource) {
+            this.currentSource.stop();
+            this.currentSource = null;
+        }
+    }
+
+    /**
+     * 批量播放完整对局
+     */
+    async playGameScript(script: string, callback?: (segment: string) => void) {
+        // 按发言段落分割（根据你的对局格式调整）
+        const segments = this.parseScriptToSegments(script);
+        
+        for (let i = 0; i < segments.length; i++) {
+            const seg = segments[i];
+            // 根据发言者选择音色（需实现角色-音色映射）
+            const voice = this.getVoiceBySpeaker(seg.speaker);
+            await this.playStream(seg.text, { voice });
+            
+            if (callback) {
+                callback(seg.text);
+            }
+            
+            // 播放间隔
+            await this.sleep(300);
+        }
+    }
+
+    private parseScriptToSegments(script: string) {
+        // 根据你的对局格式解析发言段落
+        // 例如：按 "X号玩家发言：" 分割
+        const regex = /(\d+号玩家[：:])/g;
+        const segments = [];
+        let lastIndex = 0;
+        let match;
+        
+        while ((match = regex.exec(script)) !== null) {
+            if (lastIndex > 0) {
+                const text = script.substring(lastIndex, match.index).trim();
+                if (text) {
+                    segments.push({
+                        speaker: match[1],
+                        text: text
+                    });
+                }
+            }
+            lastIndex = match.index;
+        }
+        
+        // 处理最后一段
+        if (lastIndex < script.length) {
+            segments.push({
+                speaker: '法官',
+                text: script.substring(lastIndex).trim()
+            });
+        }
+        
+        return segments;
+    }
+
+    private getVoiceBySpeaker(speaker: string): 'female' | 'male' | 'youngMale' {
+        // 实现角色到音色的映射逻辑
+        // 示例：法官用女声，1-6号用男声，7-12号用年轻男声
+        const number = parseInt(speaker);
+        if (isNaN(number)) return 'female';
+        if (number <= 6) return 'male';
+        return 'youngMale';
+    }
+
+    private sleep(ms: number) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+}
+
+export const ttsService = new TTSService();
+```
+
+### 2. 音频播放组件 (frontend/src/components/AudioPlayer.vue)
+```vue
+<template>
+  <div class="audio-player">
+    <!-- 播放控制按钮 -->
+    <div class="controls">
+      <button @click="togglePlay" :disabled="isLoading">
+        <span v-if="isPlaying">⏸️ 暂停</span>
+        <span v-else-if="isLoading">⏳ 加载中...</span>
+        <span v-else>▶️ 播放语音</span>
+      </button>
+      <button @click="stopPlay" :disabled="!isPlaying">
+        ⏹️ 停止
+      </button>
+    </div>
+
+    <!-- 播放进度 -->
+    <div class="progress" v-if="isPlaying || isLoading">
+      <div class="progress-bar" :style="{ width: progress + '%' }"></div>
+    </div>
+
+    <!-- 当前播放的文本 -->
+    <div class="current-text" v-if="currentText">
+      {{ currentText }}
+    </div>
+
+    <!-- 音色选择 -->
+    <div class="voice-selector">
+      <label>音色：</label>
+      <select v-model="selectedVoice">
+        <option value="female">晓晓 (女声)</option>
+        <option value="male">云扬 (男声)</option>
+        <option value="youngMale">云希 (年轻男声)</option>
+      </select>
+    </div>
+
+    <!-- 语速控制 -->
+    <div class="speed-control">
+      <label>语速：{{ speed }}</label>
+      <input 
+        type="range" 
+        min="0.5" 
+        max="2.0" 
+        step="0.1" 
+        v-model="speed"
+      />
+    </div>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { ref, computed } from 'vue';
+import { ttsService } from '../services/ttsService';
+
+const props = defineProps<{
+  text: string;  // 要播放的文本
+}>();
+
+const isPlaying = ref(false);
+const isLoading = ref(false);
+const progress = ref(0);
+const currentText = ref('');
+const selectedVoice = ref<'female' | 'male' | 'youngMale'>('female');
+const speed = ref(1.0);
+
+const togglePlay = async () => {
+  if (isPlaying.value) {
+    ttsService.stopPlay();
+    isPlaying.value = false;
+    return;
+  }
+
+  try {
+    isLoading.value = true;
+    currentText.value = props.text;
+    
+    await ttsService.playStream(props.text, {
+      voice: selectedVoice.value,
+      speed: speed.value
+    });
+    
+    isPlaying.value = true;
+    // 模拟进度（实际可从AudioContext获取）
+    progress.value = 100;
+  } catch (error) {
+    console.error('播放失败:', error);
+  } finally {
+    isLoading.value = false;
+    isPlaying.value = false;
+  }
+};
+
+const stopPlay = () => {
+  ttsService.stopPlay();
+  isPlaying.value = false;
+  progress.value = 0;
+};
+</script>
+
+<style scoped>
+.audio-player {
+  padding: 16px;
+  background: #f5f5f5;
+  border-radius: 8px;
+  margin: 10px 0;
+}
+
+.controls {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.controls button {
+  padding: 8px 20px;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 14px;
+  background: #4CAF50;
+  color: white;
+}
+
+.controls button:disabled {
+  background: #ccc;
+  cursor: not-allowed;
+}
+
+.progress {
+  width: 100%;
+  height: 4px;
+  background: #ddd;
+  border-radius: 2px;
+  margin: 8px 0;
+}
+
+.progress-bar {
+  height: 100%;
+  background: #4CAF50;
+  border-radius: 2px;
+  transition: width 0.3s;
+}
+
+.current-text {
+  padding: 8px;
+  background: white;
+  border-radius: 4px;
+  margin: 8px 0;
+  font-size: 14px;
+  min-height: 40px;
+  border: 1px solid #ddd;
+}
+
+.voice-selector, .speed-control {
+  margin-top: 8px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+}
+
+.speed-control input {
+  flex: 1;
+}
+</style>
+```
+
+### 3. 游戏界面集成 (frontend/src/views/GameView.vue)
+```vue
+<template>
+  <div class="game-view">
+    <h1>狼人杀对局</h1>
+    
+    <!-- 生成的对局文本 -->
+    <div class="script-display">
+      <h3>对局记录</h3>
+      <pre>{{ gameScript }}</pre>
+    </div>
+
+    <!-- TTS播放器 -->
+    <AudioPlayer :text="gameScript" />
+
+    <!-- 控制按钮 -->
+    <button @click="generateGameScript" :disabled="isGenerating">
+      {{ isGenerating ? '生成中...' : '生成新对局' }}
+    </button>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { ref } from 'vue';
+import AudioPlayer from '../components/AudioPlayer.vue';
+
+const gameScript = ref('');
+const isGenerating = ref(false);
+
+// 调用AI生成对局（你的已有逻辑）
+const generateGameScript = async () => {
+  isGenerating.value = true;
+  try {
+    // 这里调用你的AI生成接口
+    // const response = await fetch('/api/generate-game', ...);
+    // gameScript.value = response.data;
+    
+    // 示例数据
+    gameScript.value = `
+      天亮了，昨晚是平安夜。
+      现在开始警长竞选，想要竞选警长的玩家请举手。
+      1号玩家发言：我是预言家，昨晚查了5号，他是查杀！
+      5号玩家发言：1号在撒谎！我才是真预言家，昨晚查了8号是金水。
+    `;
+  } catch (error) {
+    console.error('生成失败:', error);
+  } finally {
+    isGenerating.value = false;
+  }
+};
+</script>
+```
+
+---
+
+## 🚀 部署与使用
+
+### 1. 启动后端
+```bash
+cd backend
+npm start
+# 服务运行在 http://localhost:3000
+```
+
+### 2. 启动前端
+```bash
+cd frontend
+npm run dev
+# 应用运行在 http://localhost:5173
+```
+
+### 3. API调用示例
+```javascript
+// 流式播放单段文本
+POST /api/tts/stream
+{
+    "text": "天亮了，昨晚是平安夜。",
+    "voice": "female",
+    "speed": 1.0
+}
+
+// 批量生成完整对局
+POST /api/tts/batch
+{
+    "segments": [
+        { "text": "1号玩家发言：我是预言家", "voice": "male" },
+        { "text": "5号玩家发言：我才是真预言家", "voice": "youngMale" }
+    ]
+}
+```
+
+---
+
+## 📝 进一步优化建议
+
+### 1. 缓存机制
+```javascript
+// 在后端添加内存缓存
+const cache = new Map();
+
+// 检查缓存
+const cacheKey = `${text}_${voice}_${speed}`;
+if (cache.has(cacheKey)) {
+    return cache.get(cacheKey);
+}
+// 生成后存入缓存
+cache.set(cacheKey, audioBuffer);
+```
+
+### 2. 错误降级
+```javascript
+// 如果Edge TTS失败，切换到Web Speech API
+if (!response.ok) {
+    // 前端使用Web Speech API降级
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.lang = 'zh-CN';
+    speechSynthesis.speak(utterance);
+}
+```
+
+### 3. 角色音色映射配置
+```javascript
+// 前端配置文件
+export const VOICE_MAP = {
+    '法官': 'female',
+    '1号': 'male',
+    '2号': 'youngMale',
+    '3号': 'male',
+    // ... 完整配置
+};
+```
+
+---
+
+## ⚠️ 注意事项
+
+1. **CORS配置**：确保后端正确配置了CORS，允许前端域名访问
+2. **音频格式**：Edge TTS默认输出MP3格式，确保浏览器支持
+3. **长文本处理**：单次请求建议控制在5000字以内，超出需分段
+4. **并发限制**：Edge TTS有并发限制，建议添加请求队列
+5. **网络问题**：Edge TTS需要访问微软服务，确保服务器有外网访问权限
+
+---
+
+**文档结束。**
+
+这份文档包含了完整的代码实现，可以直接喂给AI生成你的项目代码。如果遇到任何集成问题，告诉我具体的错误信息，我可以帮你调试。

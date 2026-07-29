@@ -21,6 +21,7 @@ import {
   setWorkspaceRoot,
 } from "./tools/fs.js";
 import { registerWerewolfRoutes } from "./werewolf/routes.js";
+import { registerTtsRoutes } from "./tts/ttsRoutes.js";
 
 /** 按需创建并缓存 agent，缺少 API Key 的模型不在启动时强制初始化 */
 const agentCache = new Map();
@@ -210,6 +211,9 @@ app.post("/file-changes/clear", (_req, res) => {
 /* ========== 狼人杀 API ========== */
 registerWerewolfRoutes(app);
 
+/* ========== TTS 语音合成 API ========== */
+registerTtsRoutes(app);
+
 const PORT = process.env.PORT || 3000;
 const server = app.listen(PORT, () => {
   console.log(`服务已启动: http://localhost:${PORT}`);
@@ -223,6 +227,18 @@ const server = app.listen(PORT, () => {
   console.log(`POST /file-changes/redo`);
   console.log(`POST /werewolf/games`);
   console.log(`POST /werewolf/games/:id/night|speak|vote`);
+  console.log(`  phases: night → sheriff_speech/vote(/pk) → day_speech/vote → …`);
+  console.log(`POST /tts/stream  body: { "text", "voice", "speed" }`);
+  console.log(`POST /tts/batch   body: { "segments": [{ "text", "voice" }] }`);
+  const ttsProxy =
+    process.env.EDGE_TTS_PROXY ||
+    process.env.HTTPS_PROXY ||
+    process.env.HTTP_PROXY;
+  console.log(
+    ttsProxy
+      ? `TTS 代理: 已配置`
+      : `TTS 提示: 若 /tts/stream 超时，请在 .env 设置 EDGE_TTS_PROXY=http://127.0.0.1:端口`,
+  );
   console.log(`在终端中按 Ctrl+C 可关闭服务`);
 });
 
