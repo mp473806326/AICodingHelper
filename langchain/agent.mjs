@@ -20,6 +20,7 @@ import {
   getWorkspaceRoot,
   setWorkspaceRoot,
 } from "./tools/fs.js";
+import { registerWerewolfRoutes } from "./werewolf/routes.js";
 
 /** 按需创建并缓存 agent，缺少 API Key 的模型不在启动时强制初始化 */
 const agentCache = new Map();
@@ -206,6 +207,9 @@ app.post("/file-changes/clear", (_req, res) => {
   res.json({ success: true, message: "已清空更改历史" });
 });
 
+/* ========== 狼人杀 API ========== */
+registerWerewolfRoutes(app);
+
 const PORT = process.env.PORT || 3000;
 const server = app.listen(PORT, () => {
   console.log(`服务已启动: http://localhost:${PORT}`);
@@ -217,6 +221,8 @@ const server = app.listen(PORT, () => {
   console.log(`GET  /file-changes/status`);
   console.log(`POST /file-changes/undo`);
   console.log(`POST /file-changes/redo`);
+  console.log(`POST /werewolf/games`);
+  console.log(`POST /werewolf/games/:id/night|speak|vote`);
   console.log(`在终端中按 Ctrl+C 可关闭服务`);
 });
 

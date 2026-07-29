@@ -103,19 +103,24 @@ async function doubaoFetch(url, init) {
   });
 }
 
-/** 创建一个由豆包（Doubao）驱动的 LangChain Agent */
-export function createDoubaoAgent() {
+/** 创建豆包 Chat 模型（无工具，适合狼人杀发言等纯对话） */
+export function createDoubaoChatModel(options = {}) {
   assertDoubaoApiKey();
 
-  const model = new ChatOpenAI({
-    model: DEFAULT_DOUBAO_MODEL,
-    temperature: 0,
+  return new ChatOpenAI({
+    model: options.model || DEFAULT_DOUBAO_MODEL,
+    temperature: options.temperature ?? 0.85,
     apiKey: process.env.DOUBAO_API_KEY || process.env.ARK_API_KEY,
     configuration: {
       baseURL: DOUBAO_BASE_URL,
       fetch: doubaoFetch,
     },
   });
+}
+
+/** 创建一个由豆包（Doubao）驱动的 LangChain Agent */
+export function createDoubaoAgent() {
+  const model = createDoubaoChatModel({ temperature: 0 });
 
   return createAgent({
     model,
@@ -126,5 +131,6 @@ export function createDoubaoAgent() {
 
 export const doubao = {
   DEFAULT_DOUBAO_MODEL,
+  createDoubaoChatModel,
   createDoubaoAgent,
 };

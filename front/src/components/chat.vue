@@ -405,7 +405,7 @@ async function clearMessages() {
   position: relative;
   display: flex;
   flex-direction: column;
-  height: 100svh;
+  height: 100%;
   max-width: 720px;
   margin: 0 auto;
   width: 100%;
