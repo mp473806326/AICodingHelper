@@ -21,9 +21,35 @@
       <label>
         音色
         <select v-model="selectedVoice">
-          <option value="female">晓晓（女声）</option>
-          <option value="male">云扬（男声）</option>
-          <option value="youngMale">云希（年轻男声）</option>
+          <optgroup label="女声">
+            <option value="xiaoxiao">晓晓（活泼）</option>
+            <option value="xiaoyi">晓伊（温柔）</option>
+            <option value="xiaochen">晓辰（自然）</option>
+            <option value="xiaohan">晓涵（知性）</option>
+            <option value="xiaomeng">晓梦（甜美）</option>
+            <option value="xiaomo">晓墨（冷静）</option>
+            <option value="xiaoqiu">晓秋（温和）</option>
+            <option value="xiaorui">晓睿（成熟）</option>
+            <option value="xiaoshuang">晓双（可爱）</option>
+            <option value="xiaoxuan">晓萱（自信）</option>
+            <option value="xiaoyan">晓颜（优雅）</option>
+            <option value="xiaoyou">晓悠（轻松）</option>
+          </optgroup>
+          <optgroup label="男声">
+            <option value="yunyang">云扬（新闻）</option>
+            <option value="yunxi">云希（年轻）</option>
+            <option value="yunjian">云健（运动）</option>
+            <option value="yunfeng">云枫（沉稳）</option>
+            <option value="yunhao">云皓（广告）</option>
+            <option value="yunxia">云夏（青年）</option>
+            <option value="yunye">云野（成熟）</option>
+            <option value="yunze">云泽（温和）</option>
+          </optgroup>
+          <optgroup label="粤语">
+            <option value="hiumaan">曉曼（粵語女）</option>
+            <option value="wanlung">雲龍（粵語男）</option>
+            <option value="hiugaai">曉佳（粵語女）</option>
+          </optgroup>
         </select>
       </label>
       <label class="speed">

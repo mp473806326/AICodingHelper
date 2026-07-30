@@ -6,6 +6,40 @@ import avatarDeepseek from '../assets/deepseek.webp'
 import avatarQianwen from '../assets/qianwen.webp'
 import { ttsService, type VoiceId } from '../services/ttsService'
 
+/** 音色下拉选项 */
+const VOICE_OPTIONS: { label: string; options: { value: VoiceId; label: string }[] }[] = [
+  {
+    label: '女声',
+    options: [
+      { value: 'xiaoxiao', label: '晓晓' },
+      { value: 'xiaoyi', label: '晓伊' },
+      { value: 'xiaochen', label: '晓辰' },
+      { value: 'xiaohan', label: '晓涵' },
+      { value: 'xiaomeng', label: '晓梦' },
+      { value: 'xiaomo', label: '晓墨' },
+      { value: 'xiaoqiu', label: '晓秋' },
+      { value: 'xiaorui', label: '晓睿' },
+      { value: 'xiaoshuang', label: '晓双' },
+      { value: 'xiaoxuan', label: '晓萱' },
+      { value: 'xiaoyan', label: '晓颜' },
+      { value: 'xiaoyou', label: '晓悠' },
+    ],
+  },
+  {
+    label: '男声',
+    options: [
+      { value: 'yunyang', label: '云扬' },
+      { value: 'yunxi', label: '云希' },
+      { value: 'yunjian', label: '云健' },
+      { value: 'yunfeng', label: '云枫' },
+      { value: 'yunhao', label: '云皓' },
+      { value: 'yunxia', label: '云夏' },
+      { value: 'yunye', label: '云野' },
+      { value: 'yunze', label: '云泽' },
+    ],
+  },
+]
+
 const MODEL_AVATARS: Record<string, string> = {
   deepseek: avatarDeepseek,
   tongyiqwen: avatarQianwen,
@@ -128,6 +162,10 @@ const models = ref<ModelOption[]>([])
 const defaultModelId = ref('doubao')
 /** 按座位下标 0..n-1 的发言模型 */
 const playerModels = ref<string[]>([])
+/** 按座位下标 0..n-1 的 TTS 音色 */
+const playerVoices = ref<VoiceId[]>([])
+/** 批量设置音色的默认值 */
+const defaultVoiceId = ref<VoiceId>('xiaoxiao')
 const selectedPlayerCount = ref(12)
 
 const selectedBoard = computed(
@@ -165,6 +203,23 @@ function applyDefaultToAll() {
   playerModels.value = Array.from(
     { length: selectedPlayerCount.value },
     () => id,
+  )
+}
+
+function ensurePlayerVoices(count: number) {
+  // 默认：奇数男声、偶数年轻男声（保持原 getVoiceBySpeaker 逻辑）
+  const next = playerVoices.value.slice(0, count)
+  while (next.length < count) {
+    const idx = next.length + 1 // 1-based 座位号
+    next.push(idx % 2 === 1 ? 'yunyang' : 'yunxi')
+  }
+  playerVoices.value = next
+}
+
+function applyDefaultVoiceToAll() {
+  playerVoices.value = Array.from(
+    { length: selectedPlayerCount.value },
+    () => defaultVoiceId.value,
   )
 }
 
@@ -221,13 +276,14 @@ loadModels()
 
 watch(selectedPlayerCount, (n) => {
   ensurePlayerModels(n)
+  ensurePlayerVoices(n)
 })
 
 function sleep(ms: number) {
   return new Promise<void>((resolve) => setTimeout(resolve, ms))
 }
 
-const JUDGE_VOICE: VoiceId = 'female'
+const judgeVoice = ref<VoiceId>('female')
 
 interface QueuePlayItem {
   /** judge=法官播报；speech=玩家发言正文 */
@@ -428,6 +484,7 @@ async function startGame() {
   clearSpeechPipeline()
   try {
     ensurePlayerModels(selectedPlayerCount.value)
+    ensurePlayerVoices(selectedPlayerCount.value)
     localStorage.setItem(MODEL_STORAGE_KEY, JSON.stringify(playerModels.value))
     localStorage.setItem(BOARD_STORAGE_KEY, String(selectedPlayerCount.value))
     const { data } = await axios.post<{ game: GameState }>('/api/werewolf/games', {
@@ -510,7 +567,8 @@ function speechKey(s: Speech) {
 }
 
 function voiceForPlayer(playerId: number): VoiceId {
-  return ttsService.getVoiceBySpeaker(playerId)
+  const idx = playerId - 1 // 转为 0-based
+  return playerVoices.value[idx] ?? ttsService.getVoiceBySpeaker(playerId)
 }
 
 function logKey(item: { t: number; msg: string }) {
@@ -556,7 +614,7 @@ function enqueueJudgeLines(texts: string[]) {
     pushQueueItem({
       kind: 'judge',
       text,
-      voice: JUDGE_VOICE,
+      voice: judgeVoice.value,
       key: `judge-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       highlightPlayerId: null,
     })
@@ -651,7 +709,7 @@ function enqueueSpeechPlay(speech: Speech) {
   pushQueueItem({
     kind: 'judge',
     text: intro,
-    voice: JUDGE_VOICE,
+    voice: judgeVoice.value,
     key: `intro-${key}`,
     highlightPlayerId: speech.playerId,
   })
@@ -913,6 +971,65 @@ function speechKindTag(kind?: SpeechKind) {
         </div>
       </div>
 
+      <!-- 音色设置 -->
+      <div class="setup-field">
+        <div class="setup-label-row">
+          <span class="setup-label">法官 & 玩家音色</span>
+          <div class="setup-bulk">
+            <select
+              v-model="defaultVoiceId"
+              class="model-select model-select-sm"
+              :disabled="loading"
+              aria-label="批量填充音色"
+            >
+              <optgroup
+                v-for="group in VOICE_OPTIONS"
+                :key="group.label"
+                :label="group.label"
+              >
+                <option
+                  v-for="opt in group.options"
+                  :key="opt.value"
+                  :value="opt.value"
+                >
+                  {{ opt.label }}
+                </option>
+              </optgroup>
+            </select>
+            <button
+              class="btn"
+              type="button"
+              :disabled="loading"
+              @click="applyDefaultVoiceToAll"
+            >
+              全部设为该音色
+            </button>
+          </div>
+        </div>
+        <div class="voice-setup-row">
+          <label class="voice-setup-label">法官</label>
+          <select
+            v-model="judgeVoice"
+            class="voice-select-sm"
+            :disabled="loading"
+          >
+            <optgroup
+              v-for="group in VOICE_OPTIONS"
+              :key="group.label"
+              :label="group.label"
+            >
+              <option
+                v-for="opt in group.options"
+                :key="opt.value"
+                :value="opt.value"
+              >
+                {{ opt.label }}
+              </option>
+            </optgroup>
+          </select>
+        </div>
+      </div>
+
       <div class="setup-field">
         <div class="setup-label-row">
           <span class="setup-label">各座位发言模型</span>
@@ -954,6 +1071,26 @@ function speechKindTag(kind?: SpeechKind) {
               <option v-for="m in models" :key="m.id" :value="m.id">
                 {{ m.name }}
               </option>
+            </select>
+            <select
+              v-model="playerVoices[i]"
+              class="voice-select-xs"
+              :disabled="loading"
+              :aria-label="`${i + 1}号音色`"
+            >
+              <optgroup
+                v-for="group in VOICE_OPTIONS"
+                :key="group.label"
+                :label="group.label"
+              >
+                <option
+                  v-for="opt in group.options"
+                  :key="opt.value"
+                  :value="opt.value"
+                >
+                  {{ opt.label }}
+                </option>
+              </optgroup>
             </select>
           </li>
         </ul>
@@ -1101,6 +1238,24 @@ function speechKindTag(kind?: SpeechKind) {
         <label class="voice-speed">
           语速 {{ ttsSpeed.toFixed(1) }}
           <input v-model.number="ttsSpeed" type="range" min="0.5" max="2" step="0.1" />
+        </label>
+        <label class="voice-select">
+          法官
+          <select v-model="judgeVoice">
+            <optgroup
+              v-for="group in VOICE_OPTIONS"
+              :key="group.label"
+              :label="group.label"
+            >
+              <option
+                v-for="opt in group.options"
+                :key="opt.value"
+                :value="opt.value"
+              >
+                {{ opt.label }}
+              </option>
+            </optgroup>
+          </select>
         </label>
         <button
           v-if="voicePlaying || speechPlayQueue.length > 0"
@@ -1501,6 +1656,54 @@ function speechKindTag(kind?: SpeechKind) {
   cursor: not-allowed;
 }
 
+/* 音色设置区域 */
+.voice-setup-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 8px;
+}
+
+.voice-setup-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-h);
+  min-width: 3em;
+}
+
+.voice-select-sm,
+.voice-select-xs {
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--text-h);
+  font: inherit;
+  font-size: 13px;
+  outline: none;
+  cursor: pointer;
+  max-width: 160px;
+}
+
+.voice-select-xs {
+  padding: 4px 6px;
+  font-size: 12px;
+  max-width: 110px;
+  flex-shrink: 0;
+}
+
+.voice-select-sm:focus,
+.voice-select-xs:focus {
+  outline: 2px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  outline-offset: 1px;
+}
+
+.voice-select-sm:disabled,
+.voice-select-xs:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
 .setup-actions {
   display: flex;
   flex-wrap: wrap;
@@ -1556,6 +1759,30 @@ function speechKindTag(kind?: SpeechKind) {
 
 .voice-speed input {
   width: 90px;
+}
+
+.voice-select {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text);
+}
+
+.voice-select select {
+  padding: 2px 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text-h);
+  font: inherit;
+  font-size: 12px;
+  outline: none;
+  cursor: pointer;
+}
+
+.voice-select select:focus {
+  border-color: var(--accent);
 }
 
 .btn-speak {

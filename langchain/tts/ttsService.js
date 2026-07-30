@@ -1,10 +1,36 @@
 import { Communicate } from 'edge-tts-universal';
 
-/** 音色配置 */
+/** 音色配置 — Edge TTS 全部中文普通话 + 粤语 */
 const VOICE_CONFIG = {
-  female: 'zh-CN-XiaoxiaoNeural',
-  male: 'zh-CN-YunyangNeural',
-  youngMale: 'zh-CN-YunxiNeural',
+  // 女声
+  female:      'zh-CN-XiaoxiaoNeural',   // 晓晓（活泼女声）
+  xiaoxiao:    'zh-CN-XiaoxiaoNeural',
+  xiaoyi:      'zh-CN-XiaoyiNeural',     // 晓伊（温柔女声）
+  xiaochen:    'zh-CN-XiaochenNeural',   // 晓辰（自然女声）
+  xiaohan:    'zh-CN-XiaohanNeural',    // 晓涵（知性女声）
+  xiaomeng:    'zh-CN-XiaomengNeural',   // 晓梦（甜美女声）
+  xiaomo:     'zh-CN-XiaomoNeural',     // 晓墨（冷静女声）
+  xiaoqiu:    'zh-CN-XiaoqiuNeural',    // 晓秋（温和女声）
+  xiaorui:    'zh-CN-XiaoruiNeural',    // 晓睿（成熟女声）
+  xiaoshuang: 'zh-CN-XiaoshuangNeural', // 晓双（可爱女声）
+  xiaoxuan:   'zh-CN-XiaoxuanNeural',   // 晓萱（自信女声）
+  xiaoyan:    'zh-CN-XiaoyanNeural',    // 晓颜（优雅女声）
+  xiaoyou:    'zh-CN-XiaoyouNeural',    // 晓悠（轻松女声）
+  // 男声
+  male:        'zh-CN-YunyangNeural',    // 云扬（新闻男声）
+  yunyang:    'zh-CN-YunyangNeural',
+  youngMale:   'zh-CN-YunxiNeural',      // 云希（年轻男声）
+  yunxi:      'zh-CN-YunxiNeural',
+  yunjian:    'zh-CN-YunjianNeural',     // 云健（运动男声）
+  yunfeng:    'zh-CN-YunfengNeural',     // 云枫（沉稳男声）
+  yunhao:     'zh-CN-YunhaoNeural',      // 云皓（广告男声）
+  yunxia:     'zh-CN-YunxiaNeural',      // 云夏（青年男声）
+  yunye:      'zh-CN-YunyeNeural',       // 云野（成熟男声）
+  yunze:      'zh-CN-YunzeNeural',       // 云泽（温和男声）
+  // 粤语
+  hiumaan:    'zh-CN-HiuMaanNeural',     // 曉曼（粵語女聲）
+  wanlung:    'zh-CN-WanLungNeural',     // 雲龍（粵語男聲）
+  hiugaai:    'zh-CN-HiuGaaiNeural',     // 曉佳（粵語女聲）
 };
 
 const CONNECT_TIMEOUT_MS = 8000;

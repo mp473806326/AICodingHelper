@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import axios from 'axios'
-import { nextTick, ref, watch, onMounted } from 'vue'
+import { nextTick, ref, watch, onMounted, computed } from 'vue'
+import AudioPlayer from './AudioPlayer.vue'
 
 interface ToolResult {
   name?: string
@@ -288,6 +289,14 @@ async function clearMessages() {
     // 后端清空失败不影响前端消息清空
   }
 }
+
+/** 最新一条 AI 回复文本，供语音朗读 */
+const lastAiText = computed(() => {
+  for (let i = messages.value.length - 1; i >= 0; i--) {
+    if (messages.value[i].role === 'ai') return messages.value[i].content
+  }
+  return ''
+})
 </script>
 
 <template>
@@ -344,6 +353,12 @@ async function clearMessages() {
       </div>
       <p v-if="workspaceError" class="workspace-error">{{ workspaceError }}</p>
     </header>
+
+    <AudioPlayer
+      v-if="lastAiText"
+      :text="lastAiText"
+      class="chat-audio"
+    />
 
     <div ref="listRef" class="chat-list">
       <p v-if="!messages.length" class="chat-empty">输入消息开始对话</p>
@@ -604,6 +619,11 @@ async function clearMessages() {
   margin: 6px 0 0;
   font-size: 12px;
   color: #e53e3e;
+}
+
+.chat-audio {
+  padding: 8px 20px;
+  border-bottom: 1px solid var(--border);
 }
 
 .chat-list {

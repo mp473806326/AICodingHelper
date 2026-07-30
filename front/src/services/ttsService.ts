@@ -17,7 +17,14 @@ const EDGE_COOLDOWN_MS = 60000
 /** Chrome 单条 utterance 超过约 15 秒会被静默掐断，按此长度切句连读 */
 const SPEECH_CHUNK_MAX_LEN = 60
 
-export type VoiceId = 'female' | 'male' | 'youngMale'
+export type VoiceId =
+  | 'female' | 'male' | 'youngMale'  // 别名（兼容旧版）
+  | 'xiaoxiao' | 'xiaoyi' | 'xiaochen' | 'xiaohan' | 'xiaomeng'
+  | 'xiaomo' | 'xiaoqiu' | 'xiaorui' | 'xiaoshuang' | 'xiaoxuan'
+  | 'xiaoyan' | 'xiaoyou'
+  | 'yunyang' | 'yunxi' | 'yunjian' | 'yunfeng' | 'yunhao'
+  | 'yunxia' | 'yunye' | 'yunze'
+  | 'hiumaan' | 'wanlung' | 'hiugaai'
 
 /** 限制同时在途的请求数；未获得令牌的调用不占用浏览器连接，也不开始超时计时 */
 class Semaphore {
