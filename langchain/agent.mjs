@@ -1,4 +1,5 @@
 import "dotenv/config";
+import os from "os";
 import express from "express";
 import { createDeepseekAgent } from "./models/deepseek.js";
 import { createOpenaiAgent } from "./models/openai.js";
@@ -215,8 +216,25 @@ registerWerewolfRoutes(app);
 registerTtsRoutes(app);
 
 const PORT = process.env.PORT || 3000;
-const server = app.listen(PORT, () => {
+const HOST = process.env.HOST || "0.0.0.0";
+
+/** 收集本机可访问的局域网 IPv4（含 192.x） */
+function getLanAddresses() {
+  const nets = os.networkInterfaces();
+  const addrs = [];
+  for (const list of Object.values(nets)) {
+    for (const net of list || []) {
+      if (net.family === "IPv4" && !net.internal) addrs.push(net.address);
+    }
+  }
+  return addrs;
+}
+
+const server = app.listen(PORT, HOST, () => {
   console.log(`服务已启动: http://localhost:${PORT}`);
+  for (const ip of getLanAddresses()) {
+    console.log(`局域网访问: http://${ip}:${PORT}`);
+  }
   console.log(`工作区: ${getWorkspaceRoot()}`);
   console.log(`POST /chat  body: { "message": "东京天气如何？", "model": "deepseek" }`);
   console.log(`GET  /models`);

@@ -1,4 +1,4 @@
-import { Communicate } from '@travisvn/edge-tts';
+import { Communicate } from 'edge-tts-universal';
 
 /** 音色配置 */
 const VOICE_CONFIG = {

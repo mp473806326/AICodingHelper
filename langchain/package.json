@@ -14,9 +14,11 @@
     "@langchain/google-genai": "^2.2.0",
     "@langchain/ollama": "^1.3.0",
     "@langchain/openai": "^1.5.5",
-    "@travisvn/edge-tts": "^1.0.2",
     "dotenv": "^17.4.2",
+    "edge-tts-universal": "^1.4.0",
     "express": "^5.2.1",
+    "http-proxy-agent": "^9.1.0",
+    "https-proxy-agent": "^9.1.0",
     "langchain": "^1.5.4",
     "ollama": "^0.6.3",
     "zod": "^3.25.76"
