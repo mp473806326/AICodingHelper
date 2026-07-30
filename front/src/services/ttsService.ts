@@ -1,9 +1,49 @@
 /** TTS API 调用服务（经 Vite 代理到后端 /tts，失败时降级为浏览器语音） */
 const API_BASE = '/api'
-/** 需大于后端 Edge TTS 超时（约 10s），否则会 abort 导致 DevTools「无法加载响应数据」 */
-const FETCH_TIMEOUT_MS = 20000
+/**
+ * 必须大于后端最坏单次耗时：连接超时 10s + 退避 0.5s + 重合成约 8s。
+ * 否则后端重试成功了，前端却已经 abort，白白掉一段。
+ */
+const FETCH_TIMEOUT_MS = 45000
+/**
+ * 预取是提前一整轮发起的，不加闸门会一次压十几个请求。
+ * 浏览器同源只开 6 条 HTTP/1.1 连接，排队的请求还没发出就会被超时 abort。
+ */
+const MAX_CONCURRENT_FETCH = 3
+/** 连续失败到此次数才降级为浏览器语音，避免一次偶发抖动毁掉整局 */
+const EDGE_FAILURE_THRESHOLD = 3
+/** 降级后的冷却时间，过后重新尝试 Edge TTS */
+const EDGE_COOLDOWN_MS = 60000
+/** Chrome 单条 utterance 超过约 15 秒会被静默掐断，按此长度切句连读 */
+const SPEECH_CHUNK_MAX_LEN = 60
 
 export type VoiceId = 'female' | 'male' | 'youngMale'
+
+/** 限制同时在途的请求数；未获得令牌的调用不占用浏览器连接，也不开始超时计时 */
+class Semaphore {
+  private active = 0
+  private waiting: (() => void)[] = []
+
+  constructor(private readonly limit: number) {}
+
+  acquire(): Promise<void> {
+    if (this.active < this.limit) {
+      this.active += 1
+      return Promise.resolve()
+    }
+    return new Promise<void>((resolve) => {
+      this.waiting.push(() => {
+        this.active += 1
+        resolve()
+      })
+    })
+  }
+
+  release() {
+    this.active -= 1
+    this.waiting.shift()?.()
+  }
+}
 
 export interface TTSOptions {
   voice?: VoiceId
@@ -21,8 +61,33 @@ export class TTSService {
   private currentObjectUrl: string | null = null
   private currentAudio: HTMLAudioElement | null = null
   private playToken = 0
-  /** Edge TTS 连续失败后本会话内直接用浏览器语音，避免每次等待超时 */
-  private edgeUnavailable = false
+  private readonly fetchGate = new Semaphore(MAX_CONCURRENT_FETCH)
+  private edgeFailures = 0
+  private edgeDisabledUntil = 0
+
+  /** 连续失败达到阈值后暂时改用浏览器语音，冷却结束后自动恢复 */
+  private get edgeUnavailable(): boolean {
+    if (!this.edgeDisabledUntil) return false
+    if (Date.now() >= this.edgeDisabledUntil) {
+      this.edgeDisabledUntil = 0
+      this.edgeFailures = 0
+      return false
+    }
+    return true
+  }
+
+  private noteEdgeFailure(error: unknown) {
+    this.edgeFailures += 1
+    if (this.edgeFailures >= EDGE_FAILURE_THRESHOLD && !this.edgeDisabledUntil) {
+      this.edgeDisabledUntil = Date.now() + EDGE_COOLDOWN_MS
+      console.warn(`Edge TTS 连续 ${this.edgeFailures} 次失败，暂时改用浏览器语音:`, error)
+    }
+  }
+
+  private noteEdgeSuccess() {
+    this.edgeFailures = 0
+    this.edgeDisabledUntil = 0
+  }
 
   /** 按座位号映射音色：奇数男声、偶数年轻男声，法官女声 */
   getVoiceBySpeaker(speaker: string | number): VoiceId {
@@ -35,6 +100,61 @@ export class TTSService {
   }
 
   /**
+   * 仅预取音频，不播放。成功返回 ArrayBuffer；Edge TTS 不可用时返回 null（播放时走浏览器语音）
+   */
+  async prefetchAudio(text: string, options: TTSOptions = {}): Promise<ArrayBuffer | null> {
+    const { voice = 'female', speed = 1.0 } = options
+    const trimmed = text?.trim()
+    if (!trimmed) return null
+    if (this.edgeUnavailable) return null
+
+    try {
+      const buffer = await this.fetchAudio(trimmed, voice, speed)
+      this.noteEdgeSuccess()
+      return buffer
+    } catch (error) {
+      this.noteEdgeFailure(error)
+      return null
+    }
+  }
+
+  /**
+   * 播放已预取的音频；buffer 为空时降级为浏览器语音
+   */
+  async playBuffered(
+    text: string,
+    audioData: ArrayBuffer | null,
+    options: TTSOptions = {},
+  ): Promise<void> {
+    const { voice = 'female', speed = 1.0 } = options
+    const trimmed = text?.trim()
+    if (!trimmed) return
+
+    this.stopPlay()
+    const token = ++this.playToken
+
+    if (audioData) {
+      await this.playArrayBuffer(audioData, token)
+      return
+    }
+
+    if (!this.edgeUnavailable) {
+      try {
+        const fetched = await this.fetchAudio(trimmed, voice, speed)
+        this.noteEdgeSuccess()
+        if (token !== this.playToken) return
+        await this.playArrayBuffer(fetched, token)
+        return
+      } catch (error) {
+        this.noteEdgeFailure(error)
+      }
+    }
+
+    if (token !== this.playToken) return
+    await this.fallbackSpeak(trimmed, voice, speed, token)
+  }
+
+  /**
    * 请求并播放一段语音；Edge TTS 失败/超时时降级为 Web Speech API
    */
   async playStream(text: string, options: TTSOptions = {}): Promise<void> {
@@ -43,25 +163,15 @@ export class TTSService {
     if (!trimmed) return
 
     this.stopPlay()
-    const token = ++this.playToken
-
-    if (!this.edgeUnavailable) {
-      try {
-        const audioData = await this.fetchAudio(trimmed, voice, speed)
-        if (token !== this.playToken) return
-        await this.playArrayBuffer(audioData, token)
-        return
-      } catch (error) {
-        this.edgeUnavailable = true
-        console.warn('Edge TTS 不可用，后续改用浏览器语音:', error)
-      }
-    }
-
-    if (token !== this.playToken) return
-    await this.fallbackSpeak(trimmed, voice, speed, token)
+    const audioData = this.edgeUnavailable
+      ? null
+      : await this.prefetchAudio(trimmed, { voice, speed })
+    await this.playBuffered(trimmed, audioData, { voice, speed })
   }
 
   private async fetchAudio(text: string, voice: VoiceId, speed: number): Promise<ArrayBuffer> {
+    await this.fetchGate.acquire()
+    // 计时器在拿到令牌后才启动，否则排队等待也会算进超时
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS)
     try {
@@ -83,9 +193,14 @@ export class TTSService {
         throw new Error(msg)
       }
 
-      return await response.arrayBuffer()
+      const buffer = await response.arrayBuffer()
+      if (!buffer.byteLength) {
+        throw new Error('语音数据为空')
+      }
+      return buffer
     } finally {
       clearTimeout(timer)
+      this.fetchGate.release()
     }
   }
 
@@ -172,45 +287,94 @@ export class TTSService {
     )
   }
 
-  private fallbackSpeak(
+  /** 整段发言直接交给 speechSynthesis 会被 Chrome 掐断，按标点切成短句 */
+  private splitForSpeech(text: string): string[] {
+    const parts: string[] = []
+    let buf = ''
+    for (const ch of text) {
+      buf += ch
+      const isSentenceEnd = /[。！？；!?;\n]/.test(ch)
+      const isClauseEnd = /[，、,]/.test(ch)
+      if ((isSentenceEnd && buf.length >= 12) || (isClauseEnd && buf.length >= SPEECH_CHUNK_MAX_LEN)) {
+        parts.push(buf.trim())
+        buf = ''
+      }
+    }
+    if (buf.trim()) parts.push(buf.trim())
+    return parts.filter(Boolean)
+  }
+
+  /** Chrome 的 voices 可能异步加载 */
+  private waitForVoices(): Promise<void> {
+    return new Promise((resolve) => {
+      if (speechSynthesis.getVoices().length) {
+        resolve()
+        return
+      }
+      let settled = false
+      const done = () => {
+        if (settled) return
+        settled = true
+        resolve()
+      }
+      speechSynthesis.addEventListener('voiceschanged', done, { once: true })
+      setTimeout(done, 500)
+    })
+  }
+
+  private speakChunk(
+    text: string,
+    picked: SpeechSynthesisVoice | null,
+    speed: number,
+    token: number,
+  ): Promise<void> {
+    return new Promise((resolve) => {
+      const utterance = new SpeechSynthesisUtterance(text)
+      utterance.lang = 'zh-CN'
+      utterance.rate = Math.min(2, Math.max(0.5, speed))
+      if (picked) utterance.voice = picked
+
+      let settled = false
+      let keepAlive: ReturnType<typeof setInterval> | undefined
+      const done = () => {
+        if (settled) return
+        settled = true
+        if (keepAlive) clearInterval(keepAlive)
+        resolve()
+      }
+
+      utterance.onend = done
+      utterance.onerror = done
+      // Chrome 朗读期间可能自行进入 paused，需要定期唤醒
+      keepAlive = setInterval(() => {
+        if (token !== this.playToken) {
+          done()
+          return
+        }
+        if (speechSynthesis.paused) speechSynthesis.resume()
+      }, 3000)
+
+      speechSynthesis.speak(utterance)
+    })
+  }
+
+  private async fallbackSpeak(
     text: string,
     voice: VoiceId,
     speed: number,
     token: number,
   ): Promise<void> {
-    return new Promise((resolve) => {
-      if (typeof speechSynthesis === 'undefined') {
-        resolve()
-        return
-      }
+    if (typeof speechSynthesis === 'undefined') return
 
-      let started = false
-      const speak = () => {
-        if (started || token !== this.playToken) {
-          if (!started) resolve()
-          return
-        }
-        started = true
-        speechSynthesis.cancel()
-        const utterance = new SpeechSynthesisUtterance(text)
-        utterance.lang = 'zh-CN'
-        utterance.rate = Math.min(2, Math.max(0.5, speed))
-        const picked = this.pickBrowserVoice(voice)
-        if (picked) utterance.voice = picked
-        utterance.onend = () => resolve()
-        utterance.onerror = () => resolve()
-        speechSynthesis.speak(utterance)
-      }
+    await this.waitForVoices()
+    if (token !== this.playToken) return
 
-      // Chrome：voices 可能异步加载
-      const voices = speechSynthesis.getVoices()
-      if (!voices.length) {
-        speechSynthesis.addEventListener('voiceschanged', speak, { once: true })
-        setTimeout(speak, 300)
-      } else {
-        speak()
-      }
-    })
+    speechSynthesis.cancel()
+    const picked = this.pickBrowserVoice(voice)
+    for (const chunk of this.splitForSpeech(text)) {
+      if (token !== this.playToken) return
+      await this.speakChunk(chunk, picked, speed, token)
+    }
   }
 
   stopPlay() {

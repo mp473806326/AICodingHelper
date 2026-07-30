@@ -1,8 +1,20 @@
 <script setup lang="ts">
 import axios from 'axios'
-import { computed, onUnmounted, ref } from 'vue'
-import avatarImg from '../assets/OIP.webp'
+import { computed, onUnmounted, ref, watch } from 'vue'
+import avatarDefault from '../assets/OIP.webp'
+import avatarDeepseek from '../assets/deepseek.webp'
+import avatarQianwen from '../assets/qianwen.webp'
 import { ttsService, type VoiceId } from '../services/ttsService'
+
+const MODEL_AVATARS: Record<string, string> = {
+  deepseek: avatarDeepseek,
+  tongyiqwen: avatarQianwen,
+}
+
+function avatarForModel(modelId?: string | null) {
+  if (!modelId) return avatarDefault
+  return MODEL_AVATARS[modelId] ?? avatarDefault
+}
 
 type Phase =
   | 'lobby'
@@ -27,6 +39,7 @@ interface Player {
   revealed: boolean
   canVote: boolean
   isSheriff?: boolean
+  modelId?: string
 }
 
 interface Speech {
@@ -42,6 +55,9 @@ interface Speech {
 interface GameState {
   id: string
   board: string
+  boardDesc?: string | null
+  playerCount: number
+  modelId: string
   phase: Phase
   day: number
   night: number
@@ -71,18 +87,174 @@ interface GameState {
   witch: { antidote: number; poison: number }
 }
 
+interface ModelOption {
+  id: string
+  name: string
+}
+
+interface BoardOption {
+  playerCount: number
+  board: string
+  boardDesc: string
+}
+
+const BOARD_OPTIONS: BoardOption[] = [
+  { playerCount: 6, board: '预女', boardDesc: '2狼 / 2民 / 预言家 / 女巫' },
+  { playerCount: 9, board: '预女猎', boardDesc: '3狼 / 3民 / 预言家 / 女巫 / 猎人' },
+  { playerCount: 12, board: '预女猎白', boardDesc: '4狼 / 4民 / 预言家 / 女巫 / 猎人 / 白痴' },
+]
+
+const MODEL_STORAGE_KEY = 'werewolf-player-models'
+const BOARD_STORAGE_KEY = 'werewolf-selected-board'
+
+const SPEECH_PHASES = new Set<Phase>(['day_speech', 'sheriff_speech', 'sheriff_pk'])
+
 const game = ref<GameState | null>(null)
 const loading = ref(false)
 const error = ref('')
 const speaking = ref(false)
 const autoSpeak = ref(false)
+/** 一键自动跑完全局（夜→发言→投票循环） */
+const autoPlay = ref(false)
 /** 发言生成后自动朗读 */
 const autoVoice = ref(true)
 const voicePlaying = ref(false)
 const playingSpeechKey = ref<string | null>(null)
 const ttsSpeed = ref(1.0)
+/** 停止自动时递增，打断进行中的自动循环 */
+let autoPlayToken = 0
+
+const models = ref<ModelOption[]>([])
+const defaultModelId = ref('doubao')
+/** 按座位下标 0..n-1 的发言模型 */
+const playerModels = ref<string[]>([])
+const selectedPlayerCount = ref(12)
+
+const selectedBoard = computed(
+  () =>
+    BOARD_OPTIONS.find((b) => b.playerCount === selectedPlayerCount.value) ??
+    BOARD_OPTIONS[2],
+)
+
+function modelDisplayName(modelId?: string | null) {
+  if (!modelId || modelId === 'mixed') return '各座位独立'
+  return models.value.find((m) => m.id === modelId)?.name ?? modelId
+}
+
+const headerSubtitle = computed(() => {
+  if (game.value) {
+    return `${game.value.playerCount}人${game.value.board} · 屠边 · 首日含警长竞选 · 各座位独立模型 · 观战`
+  }
+  return '可选 6 / 9 / 12 人局 · 屠边 · 首日含警长竞选 · 可为每个座位配置发言模型 · 观战模式'
+})
+
+function ensurePlayerModels(count: number, fillId?: string) {
+  const fallback =
+    fillId ||
+    defaultModelId.value ||
+    models.value[0]?.id ||
+    'doubao'
+  const next = playerModels.value.slice(0, count)
+  while (next.length < count) next.push(fallback)
+  playerModels.value = next
+}
+
+function applyDefaultToAll() {
+  const id = defaultModelId.value
+  if (!id) return
+  playerModels.value = Array.from(
+    { length: selectedPlayerCount.value },
+    () => id,
+  )
+}
+
+async function loadModels() {
+  try {
+    const { data } = await axios.get<{ models: ModelOption[] }>('/api/models')
+    models.value = data.models
+    if (data.models.some((m) => m.id === 'doubao')) {
+      defaultModelId.value = 'doubao'
+    } else if (data.models.length > 0) {
+      defaultModelId.value = data.models[0].id
+    }
+  } catch {
+    models.value = [
+      { id: 'doubao', name: '豆包' },
+      { id: 'deepseek', name: 'DeepSeek' },
+      { id: 'tongyiqwen', name: '通义千问' },
+    ]
+    defaultModelId.value = 'doubao'
+  }
+  restorePlayerModels()
+}
+
+function restorePlayerModels() {
+  const known = new Set(models.value.map((m) => m.id))
+  const fallback = defaultModelId.value
+  try {
+    const raw = localStorage.getItem(MODEL_STORAGE_KEY)
+    if (raw) {
+      const parsed = JSON.parse(raw) as unknown
+      if (Array.isArray(parsed) && parsed.every((x) => typeof x === 'string')) {
+        playerModels.value = parsed.map((id) =>
+          known.has(id) || !known.size ? id : fallback,
+        )
+        ensurePlayerModels(selectedPlayerCount.value, fallback)
+        return
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  ensurePlayerModels(selectedPlayerCount.value, fallback)
+}
+
+function restoreBoardChoice() {
+  const saved = Number(localStorage.getItem(BOARD_STORAGE_KEY))
+  if (BOARD_OPTIONS.some((b) => b.playerCount === saved)) {
+    selectedPlayerCount.value = saved
+  }
+}
+
+restoreBoardChoice()
+loadModels()
+
+watch(selectedPlayerCount, (n) => {
+  ensurePlayerModels(n)
+})
+
+function sleep(ms: number) {
+  return new Promise<void>((resolve) => setTimeout(resolve, ms))
+}
+
+const JUDGE_VOICE: VoiceId = 'female'
+
+interface QueuePlayItem {
+  /** judge=法官播报；speech=玩家发言正文 */
+  kind: 'judge' | 'speech'
+  text: string
+  voice: VoiceId
+  key: string
+  /** 文本就绪后立即预取，播完上一段再取结果播放 */
+  audioReady: Promise<ArrayBuffer | null>
+  /** 座位高亮；法官流程播报为 null */
+  highlightPlayerId: number | null
+}
+
+/** 连发+朗读：已生成且已发起 TTS 预取的待播队列 */
+const speechPlayQueue = ref<QueuePlayItem[]>([])
+/** 当前正在朗读的座位号（流程高亮跟语音走） */
+const playbackSpeakerId = ref<number | null>(null)
+const playPipelineRunning = ref(false)
+/** 清空/停止时递增，丢弃进行中的预取播放 */
+let playPipelineEpoch = 0
+/** 服务端已进入投票等阶段，等语音队列播完再应用到 UI */
+const pendingGameAfterPlay = ref<GameState | null>(null)
 
 onUnmounted(() => {
+  autoPlay.value = false
+  autoSpeak.value = false
+  autoPlayToken += 1
   ttsService.stopPlay()
 })
 
@@ -120,6 +292,14 @@ const currentSpeakerId = computed(() => {
   const { speechQueue, speechIndex } = game.value
   if (speechIndex >= speechQueue.length) return null
   return speechQueue[speechIndex]
+})
+
+/** 座位高亮：优先当前朗读 / 待播队列，而非接口预生成进度 */
+const displaySpeakerId = computed(() => {
+  if (playbackSpeakerId.value != null) return playbackSpeakerId.value
+  const next = speechPlayQueue.value.find((item) => item.highlightPlayerId != null)
+  if (next?.highlightPlayerId != null) return next.highlightPlayerId
+  return currentSpeakerId.value
 })
 
 const leftColumn = computed(() => {
@@ -221,13 +401,44 @@ function errMsg(err: unknown) {
   return err instanceof Error ? err.message : '请求失败'
 }
 
+function clearSpeechPipeline(opts?: { applyPending?: boolean }) {
+  playPipelineEpoch += 1
+  speechPlayQueue.value = []
+  playbackSpeakerId.value = null
+  playPipelineRunning.value = false
+  if (opts?.applyPending && pendingGameAfterPlay.value) {
+    game.value = pendingGameAfterPlay.value
+    pendingGameAfterPlay.value = null
+    autoSpeak.value = false
+  } else {
+    pendingGameAfterPlay.value = null
+  }
+}
+
+function stopAutoPlay() {
+  autoPlay.value = false
+  autoSpeak.value = false
+  autoPlayToken += 1
+}
+
 async function startGame() {
   loading.value = true
   error.value = ''
-  autoSpeak.value = false
+  stopAutoPlay()
+  clearSpeechPipeline()
   try {
-    const { data } = await axios.post<{ game: GameState }>('/api/werewolf/games')
+    ensurePlayerModels(selectedPlayerCount.value)
+    localStorage.setItem(MODEL_STORAGE_KEY, JSON.stringify(playerModels.value))
+    localStorage.setItem(BOARD_STORAGE_KEY, String(selectedPlayerCount.value))
+    const { data } = await axios.post<{ game: GameState }>('/api/werewolf/games', {
+      playerCount: selectedPlayerCount.value,
+      model: defaultModelId.value,
+      playerModels: playerModels.value,
+    })
     game.value = data.game
+    if (autoVoice.value) {
+      enqueueJudgeLines(newFlowLogMessages([], data.game.logs))
+    }
   } catch (e) {
     error.value = errMsg(e)
   } finally {
@@ -235,17 +446,60 @@ async function startGame() {
   }
 }
 
+/**
+ * 接口结果先写入前端缓存；开启朗读时阶段切换等语音队列播完再落地。
+ * 战报/发言/死亡等展示字段可提前合并，流程字段（phase 等）跟播放走。
+ */
+function applyGameWithVoice(nextGame: GameState, judgeLines: string[]) {
+  const lines = judgeLines.map((t) => t.trim()).filter(Boolean)
+  if (!autoVoice.value || !lines.length) {
+    game.value = nextGame
+    return
+  }
+
+  pendingGameAfterPlay.value = nextGame
+  if (game.value) {
+    game.value = {
+      ...game.value,
+      logs: nextGame.logs,
+      speeches: nextGame.speeches,
+      players: nextGame.players,
+      aliveCount: nextGame.aliveCount,
+      lastNightDeaths: nextGame.lastNightDeaths,
+      lastExile: nextGame.lastExile,
+      witch: nextGame.witch,
+      votes: nextGame.votes,
+      voteTally: nextGame.voteTally,
+      winner: nextGame.winner,
+      winnerReason: nextGame.winnerReason,
+      sheriffId: nextGame.sheriffId,
+      sheriffDone: nextGame.sheriffDone,
+      sheriffRunners: nextGame.sheriffRunners,
+      sheriffBallot: nextGame.sheriffBallot,
+      sheriffWithdrawn: nextGame.sheriffWithdrawn,
+      sheriffPkCandidates: nextGame.sheriffPkCandidates,
+      sheriffElectResult: nextGame.sheriffElectResult,
+    }
+  } else {
+    game.value = nextGame
+  }
+  enqueueJudgeLines(lines)
+}
+
 async function runNight() {
-  if (!game.value || loading.value) return
+  if (!game.value || loading.value || pendingGameAfterPlay.value) return
   loading.value = true
   error.value = ''
   try {
+    const prevLogs = game.value.logs
     const { data } = await axios.post<{ game: GameState }>(
       `/api/werewolf/games/${game.value.id}/night`,
     )
-    game.value = data.game
+    const lines = newFlowLogMessages(prevLogs, data.game.logs)
+    applyGameWithVoice(data.game, lines)
   } catch (e) {
     error.value = errMsg(e)
+    stopAutoPlay()
   } finally {
     loading.value = false
   }
@@ -257,6 +511,57 @@ function speechKey(s: Speech) {
 
 function voiceForPlayer(playerId: number): VoiceId {
   return ttsService.getVoiceBySpeaker(playerId)
+}
+
+function logKey(item: { t: number; msg: string }) {
+  return `${item.t}|${item.msg}`
+}
+
+/** 新增流程战报（过滤发言正文），按时间正序供法官朗读 */
+function newFlowLogMessages(
+  prevLogs: { t: number; msg: string }[],
+  nextLogs: { t: number; msg: string }[],
+): string[] {
+  const prevKeys = new Set(prevLogs.map(logKey))
+  const fresh = nextLogs.filter(
+    (item) => !prevKeys.has(logKey(item)) && !SPEECH_LOG_RE.test(item.msg),
+  )
+  return fresh
+    .slice()
+    .reverse()
+    .map((item) => item.msg)
+}
+
+function speechIntroText(speech: Speech) {
+  if (speech.kind === 'sheriff') return `请${speech.playerId}号玩家进行上警发言。`
+  if (speech.kind === 'sheriff_pk') return `请${speech.playerId}号玩家进行PK发言。`
+  return `请${speech.playerId}号玩家发言。`
+}
+
+function pushQueueItem(item: Omit<QueuePlayItem, 'audioReady'> & { audioReady?: Promise<ArrayBuffer | null> }) {
+  const audioReady =
+    item.audioReady ??
+    ttsService.prefetchAudio(item.text, {
+      voice: item.voice,
+      speed: ttsSpeed.value,
+    })
+  speechPlayQueue.value.push({ ...item, audioReady })
+}
+
+/** 法官播报：夜间信息、上警/退水、投票结果等 */
+function enqueueJudgeLines(texts: string[]) {
+  const lines = texts.map((t) => t.trim()).filter(Boolean)
+  if (!lines.length) return
+  for (const text of lines) {
+    pushQueueItem({
+      kind: 'judge',
+      text,
+      voice: JUDGE_VOICE,
+      key: `judge-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      highlightPlayerId: null,
+    })
+  }
+  void drainPlayQueue()
 }
 
 async function playSpeechText(text: string, playerId: number, key: string) {
@@ -286,9 +591,98 @@ async function playSpeechText(text: string, playerId: number, key: string) {
   }
 }
 
-async function playLatestSpeech(speech: Speech) {
+async function playQueuedItem(item: QueuePlayItem, epoch: number) {
+  voicePlaying.value = true
+  playingSpeechKey.value = item.key
+  try {
+    const audioData = await item.audioReady
+    if (epoch !== playPipelineEpoch) return
+    await ttsService.playBuffered(item.text, audioData, {
+      voice: item.voice,
+      speed: ttsSpeed.value,
+    })
+  } catch (e) {
+    console.error(e)
+  } finally {
+    if (playingSpeechKey.value === item.key) {
+      voicePlaying.value = false
+      playingSpeechKey.value = null
+    }
+  }
+}
+
+async function drainPlayQueue() {
+  if (playPipelineRunning.value) return
+  playPipelineRunning.value = true
+  const epoch = playPipelineEpoch
+  try {
+    while (speechPlayQueue.value.length > 0) {
+      if (epoch !== playPipelineEpoch) break
+      const item = speechPlayQueue.value.shift()!
+      playbackSpeakerId.value = item.highlightPlayerId
+      await playQueuedItem(item, epoch)
+      if (epoch !== playPipelineEpoch) break
+      playbackSpeakerId.value = null
+    }
+    if (
+      epoch === playPipelineEpoch &&
+      pendingGameAfterPlay.value &&
+      speechPlayQueue.value.length === 0
+    ) {
+      game.value = pendingGameAfterPlay.value
+      pendingGameAfterPlay.value = null
+      autoSpeak.value = false
+    }
+  } finally {
+    if (epoch === playPipelineEpoch) {
+      playPipelineRunning.value = false
+      if (speechPlayQueue.value.length > 0) {
+        void drainPlayQueue()
+      }
+    }
+  }
+}
+
+/** 先播「N号玩家发言」，再播正文；文本一到立刻预取 */
+function enqueueSpeechPlay(speech: Speech) {
+  if (!speech?.text?.trim()) return
   const key = speechKey(speech)
-  await playSpeechText(speech.text, speech.playerId, key)
+  const intro = speechIntroText(speech)
+  pushQueueItem({
+    kind: 'judge',
+    text: intro,
+    voice: JUDGE_VOICE,
+    key: `intro-${key}`,
+    highlightPlayerId: speech.playerId,
+  })
+  pushQueueItem({
+    kind: 'speech',
+    text: speech.text,
+    voice: voiceForPlayer(speech.playerId),
+    key,
+    highlightPlayerId: speech.playerId,
+  })
+  void drainPlayQueue()
+}
+
+/**
+ * 发言接口返回：文本立刻缓存；仍在发言阶段则同步进度。
+ * 阶段已切走时，发言列表先合并，投票等阶段等语音播完再应用。
+ */
+function applySpeechProgress(nextGame: GameState, stillSpeechPhase: boolean) {
+  const prevLogs = game.value?.logs ?? []
+  const judgeLines = newFlowLogMessages(prevLogs, nextGame.logs)
+
+  if (stillSpeechPhase) {
+    // 发言正文已缓存；speechIndex 可超前，座位高亮跟 playbackSpeakerId
+    game.value = nextGame
+    if (autoVoice.value && judgeLines.length) {
+      enqueueJudgeLines(judgeLines)
+    }
+    return
+  }
+
+  applyGameWithVoice(nextGame, judgeLines)
 }
 
 async function nextSpeech() {
@@ -302,44 +696,145 @@ async function nextSpeech() {
       game: GameState
       speech?: Speech
     }>(`/api/werewolf/games/${game.value.id}/speak`)
-    game.value = data.game
+
+    const stillSpeechPhase = SPEECH_PHASES.has(data.game.phase)
 
     if (autoVoice.value && data.speech?.text) {
+      // 文本 + TTS 预取入队；连发时继续请求下一位（播放与请求并行）
+      enqueueSpeechPlay(data.speech)
+      applySpeechProgress(data.game, stillSpeechPhase)
       speaking.value = false
-      await playLatestSpeech(data.speech)
+      if (autoSpeak.value && stillSpeechPhase) {
+        await nextSpeech()
+      } else if (!stillSpeechPhase) {
+        autoSpeak.value = false
+      }
+      return
     }
 
-    if (autoSpeak.value && isSpeechPhase.value) {
+    const prevLogs = game.value.logs
+    const lines = newFlowLogMessages(prevLogs, data.game.logs)
+    if (stillSpeechPhase) {
+      game.value = data.game
+      if (autoVoice.value && lines.length) enqueueJudgeLines(lines)
+    } else {
+      applyGameWithVoice(data.game, lines)
+    }
+
+    if (autoSpeak.value && SPEECH_PHASES.has(data.game.phase)) {
       speaking.value = false
       await nextSpeech()
       return
     }
+    autoSpeak.value = false
   } catch (e) {
     error.value = errMsg(e)
-    autoSpeak.value = false
+    stopAutoPlay()
   } finally {
     speaking.value = false
   }
 }
 
 async function runVote() {
-  if (!game.value || loading.value) return
+  if (!game.value || loading.value || pendingGameAfterPlay.value) return
   loading.value = true
   error.value = ''
   autoSpeak.value = false
   try {
+    const prevLogs = game.value.logs
     const { data } = await axios.post<{ game: GameState }>(
       `/api/werewolf/games/${game.value.id}/vote`,
     )
-    game.value = data.game
+    const lines = newFlowLogMessages(prevLogs, data.game.logs)
+    applyGameWithVoice(data.game, lines)
   } catch (e) {
     error.value = errMsg(e)
+    stopAutoPlay()
   } finally {
     loading.value = false
   }
 }
 
+/** 等待请求/朗读结束，再进入下一自动步骤 */
+async function waitForAutoIdle(token: number): Promise<boolean> {
+  for (;;) {
+    if (!autoPlay.value || token !== autoPlayToken) return false
+    if (loading.value || speaking.value) {
+      await sleep(80)
+      continue
+    }
+    if (
+      speechPlayQueue.value.length > 0 ||
+      playPipelineRunning.value ||
+      voicePlaying.value
+    ) {
+      await sleep(80)
+      continue
+    }
+    if (pendingGameAfterPlay.value) {
+      game.value = pendingGameAfterPlay.value
+      pendingGameAfterPlay.value = null
+      autoSpeak.value = false
+    }
+    return true
+  }
+}
+
+async function runAutoPlayLoop() {
+  const token = ++autoPlayToken
+  autoPlay.value = true
+  while (autoPlay.value && token === autoPlayToken) {
+    const idle = await waitForAutoIdle(token)
+    if (!idle) break
+
+    const g = game.value
+    if (!g || g.phase === 'ended') {
+      stopAutoPlay()
+      break
+    }
+
+    if (g.phase === 'night') {
+      await runNight()
+      continue
+    }
+
+    if (SPEECH_PHASES.has(g.phase)) {
+      autoSpeak.value = true
+      await nextSpeech()
+      continue
+    }
+
+    if (g.phase === 'sheriff_vote' || g.phase === 'day_vote') {
+      await runVote()
+      continue
+    }
+
+    stopAutoPlay()
+    break
+  }
+}
+
+async function toggleAutoPlay() {
+  if (autoPlay.value) {
+    stopAutoPlay()
+    return
+  }
+  await runAutoPlayLoop()
+}
+
+/** 开局并自动跑完全程 */
+async function startGameAuto() {
+  await startGame()
+  if (game.value && !error.value) {
+    await runAutoPlayLoop()
+  }
+}
+
 async function toggleAutoSpeak() {
+  if (autoPlay.value) {
+    stopAutoPlay()
+    return
+  }
   autoSpeak.value = !autoSpeak.value
   if (autoSpeak.value) {
     await nextSpeech()
@@ -350,9 +845,10 @@ function resetLocal() {
   ttsService.stopPlay()
   game.value = null
   error.value = ''
-  autoSpeak.value = false
+  stopAutoPlay()
   voicePlaying.value = false
   playingSpeechKey.value = null
+  clearSpeechPipeline()
 }
 
 function roleClass(p: Player) {
@@ -380,8 +876,8 @@ function speechKindTag(kind?: SpeechKind) {
   <div class="werewolf">
     <header class="header">
       <div>
-        <h1>狼人杀 · 预女猎白</h1>
-        <p>12人屠边局 · 首日含警长竞选 · 发言由豆包生成 · 观战模式</p>
+        <h1>狼人杀 · {{ game?.board ?? selectedBoard.board }}</h1>
+        <p>{{ headerSubtitle }}</p>
       </div>
       <button
         v-if="game"
@@ -397,13 +893,84 @@ function speechKindTag(kind?: SpeechKind) {
     <p v-if="error" class="error">{{ error }}</p>
 
     <section v-if="!game" class="panel setup">
+      <div class="setup-field">
+        <span class="setup-label">人数板子</span>
+        <div class="board-options" role="radiogroup" aria-label="人数板子">
+          <button
+            v-for="opt in BOARD_OPTIONS"
+            :key="opt.playerCount"
+            class="board-card"
+            type="button"
+            role="radio"
+            :aria-checked="selectedPlayerCount === opt.playerCount"
+            :class="{ active: selectedPlayerCount === opt.playerCount }"
+            :disabled="loading"
+            @click="selectedPlayerCount = opt.playerCount"
+          >
+            <strong>{{ opt.playerCount }}人 · {{ opt.board }}</strong>
+            <span>{{ opt.boardDesc }}</span>
+          </button>
+        </div>
+      </div>
+
+      <div class="setup-field">
+        <div class="setup-label-row">
+          <span class="setup-label">各座位发言模型</span>
+          <div class="setup-bulk">
+            <select
+              v-model="defaultModelId"
+              class="model-select model-select-sm"
+              :disabled="loading || !models.length"
+              aria-label="批量填充模型"
+            >
+              <option v-for="m in models" :key="m.id" :value="m.id">
+                {{ m.name }}
+              </option>
+            </select>
+            <button
+              class="btn"
+              type="button"
+              :disabled="loading || !models.length"
+              @click="applyDefaultToAll"
+            >
+              全部设为该模型
+            </button>
+          </div>
+        </div>
+        <ul class="seat-model-list">
+          <li v-for="(_, i) in playerModels" :key="i" class="seat-model-row">
+            <img
+              class="seat-model-avatar"
+              :src="avatarForModel(playerModels[i])"
+              :alt="`${i + 1}号`"
+            />
+            <span class="seat-model-name">{{ i + 1 }}号</span>
+            <select
+              v-model="playerModels[i]"
+              class="model-select"
+              :disabled="loading || !models.length"
+              :aria-label="`${i + 1}号发言模型`"
+            >
+              <option v-for="m in models" :key="m.id" :value="m.id">
+                {{ m.name }}
+              </option>
+            </select>
+          </li>
+        </ul>
+      </div>
+
       <p class="setup-desc">
-        固定板子：4狼 / 4民 / 预言家 / 女巫 / 猎人 / 白痴。流程：首夜 → 警长竞选（上警发言→退水→投票/PK）→
-        白天发言放逐 → 循环夜昼。夜间由规则引擎结算，发言调用豆包。
+        当前板子：{{ selectedBoard.boardDesc }}。流程：首夜 → 警长竞选（上警发言→退水→投票/PK）→
+        白天发言放逐 → 循环夜昼。夜间由规则引擎结算，每位玩家发言调用其座位所选模型。
       </p>
-      <button class="btn primary" type="button" :disabled="loading" @click="startGame">
-        {{ loading ? '开局中…' : '开始新局' }}
-      </button>
+      <div class="setup-actions">
+        <button class="btn primary" type="button" :disabled="loading" @click="startGame">
+          {{ loading ? '开局中…' : '开始新局' }}
+        </button>
+        <button class="btn" type="button" :disabled="loading" @click="startGameAuto">
+          {{ loading ? '开局中…' : '一键自动完赛' }}
+        </button>
+      </div>
     </section>
 
     <template v-else>
@@ -418,7 +985,17 @@ function speechKindTag(kind?: SpeechKind) {
         </div>
         <div class="status-item">
           <span class="label">存活</span>
-          <span class="value">{{ game.aliveCount }} / 12</span>
+          <span class="value"
+            >{{ game.aliveCount }} / {{ game.playerCount ?? game.players.length }}</span
+          >
+        </div>
+        <div class="status-item">
+          <span class="label">板子</span>
+          <span class="value">{{ game.playerCount }}人·{{ game.board }}</span>
+        </div>
+        <div class="status-item">
+          <span class="label">模型</span>
+          <span class="value">{{ modelDisplayName(game.modelId) }}</span>
         </div>
         <div class="status-item">
           <span class="label">警长</span>
@@ -469,20 +1046,40 @@ function speechKindTag(kind?: SpeechKind) {
 
       <section class="panel actions">
         <button
+          v-if="game.phase !== 'ended'"
+          class="btn"
+          :class="{ primary: autoPlay }"
+          type="button"
+          :disabled="loading && !autoPlay"
+          @click="toggleAutoPlay"
+        >
+          {{ autoPlay ? '停止自动' : '一键自动' }}
+        </button>
+
+        <button
           v-if="game.phase === 'night'"
           class="btn primary"
           type="button"
-          :disabled="loading"
+          :disabled="loading || autoPlay || !!pendingGameAfterPlay"
           @click="runNight"
         >
-          {{ loading ? '结算中…' : '结算夜晚' }}
+          {{ loading ? '结算中…' : pendingGameAfterPlay ? '播报中…' : '结算夜晚' }}
         </button>
 
         <template v-if="isSpeechPhase">
           <button
             class="btn primary"
             type="button"
-            :disabled="speaking || loading || voicePlaying || currentSpeakerId == null"
+            :disabled="
+              speaking ||
+              loading ||
+              voicePlaying ||
+              autoSpeak ||
+              autoPlay ||
+              playPipelineRunning ||
+              speechPlayQueue.length > 0 ||
+              currentSpeakerId == null
+            "
             @click="nextSpeech"
           >
             {{ speakButtonLabel }}
@@ -490,29 +1087,30 @@ function speechKindTag(kind?: SpeechKind) {
           <button
             class="btn"
             type="button"
-            :disabled="speaking || loading || voicePlaying"
+            :disabled="!autoSpeak && !autoPlay && (speaking || loading || voicePlaying)"
             @click="toggleAutoSpeak"
           >
-            {{ autoSpeak ? '停止连发' : '自动连发' }}
+            {{ autoSpeak || autoPlay ? '停止连发' : '自动连发' }}
           </button>
         </template>
 
         <label class="voice-toggle">
           <input v-model="autoVoice" type="checkbox" />
-          自动朗读
+          自动朗读（含法官）
         </label>
         <label class="voice-speed">
           语速 {{ ttsSpeed.toFixed(1) }}
           <input v-model.number="ttsSpeed" type="range" min="0.5" max="2" step="0.1" />
         </label>
         <button
-          v-if="voicePlaying"
+          v-if="voicePlaying || speechPlayQueue.length > 0"
           class="btn"
           type="button"
           @click="
             ttsService.stopPlay();
             voicePlaying = false;
-            playingSpeechKey = null
+            playingSpeechKey = null;
+            clearSpeechPipeline({ applyPending: true })
           "
         >
           停止朗读
@@ -522,10 +1120,10 @@ function speechKindTag(kind?: SpeechKind) {
           v-if="isVotePhase"
           class="btn primary"
           type="button"
-          :disabled="loading"
+          :disabled="loading || autoPlay || !!pendingGameAfterPlay"
           @click="runVote"
         >
-          {{ voteButtonLabel }}
+          {{ pendingGameAfterPlay ? '播报中…' : voteButtonLabel }}
         </button>
       </section>
 
@@ -540,14 +1138,14 @@ function speechKindTag(kind?: SpeechKind) {
                 class="player"
                 :class="{
                   dead: !p.alive,
-                  speaking: currentSpeakerId === p.id,
+                  speaking: displaySpeakerId === p.id,
                   revealed: p.revealed,
                   sheriff: p.isSheriff,
                   runner: isRunner(p.id) && !game.sheriffDone,
                   ballot: isOnBallot(p.id) && (game.phase === 'sheriff_vote' || game.phase === 'sheriff_pk'),
                 }"
               >
-                <img class="avatar" :src="avatarImg" :alt="p.name" />
+                <img class="avatar" :src="avatarForModel(p.modelId)" :alt="p.name" />
                 <div class="player-main">
                   <strong>
                     {{ p.name }}
@@ -562,6 +1160,7 @@ function speechKindTag(kind?: SpeechKind) {
                     <template v-if="p.revealed"> · 已翻牌</template>
                     <template v-if="!p.canVote && p.alive"> · 无票权</template>
                   </span>
+                  <span class="model-tag">{{ modelDisplayName(p.modelId) }}</span>
                 </div>
                 <span class="alive-tag">{{ p.alive ? '存活' : '出局' }}</span>
               </li>
@@ -573,14 +1172,14 @@ function speechKindTag(kind?: SpeechKind) {
                 class="player"
                 :class="{
                   dead: !p.alive,
-                  speaking: currentSpeakerId === p.id,
+                  speaking: displaySpeakerId === p.id,
                   revealed: p.revealed,
                   sheriff: p.isSheriff,
                   runner: isRunner(p.id) && !game.sheriffDone,
                   ballot: isOnBallot(p.id) && (game.phase === 'sheriff_vote' || game.phase === 'sheriff_pk'),
                 }"
               >
-                <img class="avatar" :src="avatarImg" :alt="p.name" />
+                <img class="avatar" :src="avatarForModel(p.modelId)" :alt="p.name" />
                 <div class="player-main">
                   <strong>
                     {{ p.name }}
@@ -595,6 +1194,7 @@ function speechKindTag(kind?: SpeechKind) {
                     <template v-if="p.revealed"> · 已翻牌</template>
                     <template v-if="!p.canVote && p.alive"> · 无票权</template>
                   </span>
+                  <span class="model-tag">{{ modelDisplayName(p.modelId) }}</span>
                 </div>
                 <span class="alive-tag">{{ p.alive ? '存活' : '出局' }}</span>
               </li>
@@ -754,6 +1354,168 @@ function speechKindTag(kind?: SpeechKind) {
   font-size: 14px;
   color: var(--text);
   line-height: 1.5;
+}
+
+.setup-field {
+  margin-bottom: 14px;
+}
+
+.setup-label {
+  display: block;
+  margin-bottom: 8px;
+  font-size: 13px;
+  color: var(--text-h);
+  font-weight: 500;
+}
+
+.setup-label-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.setup-label-row .setup-label {
+  margin-bottom: 0;
+}
+
+.setup-bulk {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.seat-model-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 8px;
+}
+
+.seat-model-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
+}
+
+.seat-model-avatar {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  object-fit: cover;
+  flex-shrink: 0;
+}
+
+.seat-model-name {
+  flex-shrink: 0;
+  width: 2.5em;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-h);
+}
+
+.seat-model-row .model-select {
+  flex: 1;
+  min-width: 0;
+  width: auto;
+}
+
+.board-options {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.board-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  align-items: flex-start;
+  text-align: left;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
+  color: var(--text);
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.board-card strong {
+  font-size: 14px;
+  color: var(--text-h);
+}
+
+.board-card span {
+  font-size: 12px;
+  line-height: 1.35;
+  color: var(--text);
+}
+
+.board-card:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.board-card.active {
+  border-color: var(--accent);
+  background: var(--accent-bg);
+}
+
+.board-card:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.model-select {
+  width: min(280px, 100%);
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--text-h);
+  font-size: 14px;
+}
+
+.model-select-sm {
+  width: min(160px, 100%);
+  padding: 6px 8px;
+  font-size: 13px;
+}
+
+.model-select:focus {
+  outline: 2px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  outline-offset: 1px;
+}
+
+.model-select:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.setup-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+@media (max-width: 720px) {
+  .board-options {
+    grid-template-columns: 1fr;
+  }
+
+  .seat-model-list {
+    grid-template-columns: 1fr;
+  }
 }
 
 .ended h2 {
@@ -934,6 +1696,14 @@ function speechKindTag(kind?: SpeechKind) {
 
 .role-villager {
   color: var(--text);
+}
+
+.model-tag {
+  display: block;
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--text);
+  opacity: 0.85;
 }
 
 .alive-tag {

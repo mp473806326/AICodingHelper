@@ -1,12 +1,10 @@
 /**
- * 狼人杀·预女猎白标准局 (12人)
- * 板子：4狼 / 4民 / 预言家 / 女巫 / 猎人 / 白痴
+ * 狼人杀·可配置人数局
+ * 6人预女 / 9人预女猎 / 12人预女猎白
  * 流程：首夜 → 警长竞选 → 白天发言放逐 → 循环夜/昼
  */
 
 import { randomUUID } from "crypto";
-
-export const PLAYER_COUNT = 12;
 
 export const ROLES = {
   WEREWOLF: "werewolf",
@@ -31,21 +29,61 @@ export const CAMP = {
   GOOD: "good",
 };
 
-/** 固定角色池：4狼4民+预女猎白 */
-export const ROLE_POOL = [
-  ROLES.WEREWOLF,
-  ROLES.WEREWOLF,
-  ROLES.WEREWOLF,
-  ROLES.WEREWOLF,
-  ROLES.VILLAGER,
-  ROLES.VILLAGER,
-  ROLES.VILLAGER,
-  ROLES.VILLAGER,
-  ROLES.SEER,
-  ROLES.WITCH,
-  ROLES.HUNTER,
-  ROLES.IDIOT,
-];
+/** 各人数板子配置 */
+export const BOARD_CONFIGS = {
+  6: {
+    playerCount: 6,
+    board: "预女",
+    boardDesc: "2狼 / 2民 / 预言家 / 女巫",
+    roles: [
+      ROLES.WEREWOLF,
+      ROLES.WEREWOLF,
+      ROLES.VILLAGER,
+      ROLES.VILLAGER,
+      ROLES.SEER,
+      ROLES.WITCH,
+    ],
+  },
+  9: {
+    playerCount: 9,
+    board: "预女猎",
+    boardDesc: "3狼 / 3民 / 预言家 / 女巫 / 猎人",
+    roles: [
+      ROLES.WEREWOLF,
+      ROLES.WEREWOLF,
+      ROLES.WEREWOLF,
+      ROLES.VILLAGER,
+      ROLES.VILLAGER,
+      ROLES.VILLAGER,
+      ROLES.SEER,
+      ROLES.WITCH,
+      ROLES.HUNTER,
+    ],
+  },
+  12: {
+    playerCount: 12,
+    board: "预女猎白",
+    boardDesc: "4狼 / 4民 / 预言家 / 女巫 / 猎人 / 白痴",
+    roles: [
+      ROLES.WEREWOLF,
+      ROLES.WEREWOLF,
+      ROLES.WEREWOLF,
+      ROLES.WEREWOLF,
+      ROLES.VILLAGER,
+      ROLES.VILLAGER,
+      ROLES.VILLAGER,
+      ROLES.VILLAGER,
+      ROLES.SEER,
+      ROLES.WITCH,
+      ROLES.HUNTER,
+      ROLES.IDIOT,
+    ],
+  },
+};
+
+/** @deprecated 使用 BOARD_CONFIGS[12]；保留兼容 */
+export const PLAYER_COUNT = 12;
+export const ROLE_POOL = BOARD_CONFIGS[12].roles;
 
 export const PHASE = {
   LOBBY: "lobby",
@@ -160,9 +198,46 @@ function applyWinner(game, result) {
   return true;
 }
 
-/** 创建新局 */
-export function createGame() {
-  const roles = shuffle(ROLE_POOL);
+/**
+ * 解析座位模型配置
+ * @param {number} playerCount
+ * @param {{ modelId?: string, playerModels?: string[] | Record<string, string> }} options
+ * @returns {string[]}
+ */
+function resolvePlayerModels(playerCount, options = {}) {
+  const fallback =
+    typeof options.modelId === "string" && options.modelId.trim()
+      ? options.modelId.trim()
+      : "doubao";
+  const raw = options.playerModels;
+  const list = Array.from({ length: playerCount }, (_, i) => {
+    let id = null;
+    if (Array.isArray(raw)) {
+      id = raw[i];
+    } else if (raw && typeof raw === "object") {
+      id = raw[String(i + 1)] ?? raw[i + 1] ?? raw[i];
+    }
+    return typeof id === "string" && id.trim() ? id.trim() : fallback;
+  });
+  return list;
+}
+
+/**
+ * 创建新局
+ * @param {{ playerCount?: number, modelId?: string, playerModels?: string[] | Record<string, string> }} [options]
+ */
+export function createGame(options = {}) {
+  const playerCount = Number(options.playerCount) || 12;
+  const config = BOARD_CONFIGS[playerCount];
+  if (!config) {
+    throw new Error(`不支持的人数：${playerCount}，可选 6 / 9 / 12`);
+  }
+  const playerModels = resolvePlayerModels(config.playerCount, options);
+  /** 兼容旧字段：多数座位相同时展示该模型，否则标记为 mixed */
+  const uniqueModels = [...new Set(playerModels)];
+  const modelId = uniqueModels.length === 1 ? uniqueModels[0] : "mixed";
+
+  const roles = shuffle(config.roles);
   const players = roles.map((role, i) => ({
     id: i + 1,
     name: `${i + 1}号`,
@@ -172,11 +247,15 @@ export function createGame() {
     revealed: false,
     canVote: true,
     poisonedMute: false,
+    modelId: playerModels[i],
   }));
 
   const game = {
     id: randomUUID(),
-    board: "预女猎白",
+    board: config.board,
+    boardDesc: config.boardDesc,
+    playerCount: config.playerCount,
+    modelId,
     phase: PHASE.NIGHT,
     day: 0,
     night: 1,
@@ -211,7 +290,13 @@ export function createGame() {
     createdAt: Date.now(),
   };
 
-  pushLog(game, "发牌完成：4狼 / 4民 / 预言家 / 女巫 / 猎人 / 白痴。进入第 1 夜。");
+  const modelSummary = players
+    .map((p) => `${p.id}号=${p.modelId}`)
+    .join("，");
+  pushLog(
+    game,
+    `发牌完成（${config.playerCount}人·${config.board}）：${config.boardDesc}。各座位发言模型：${modelSummary}。进入第 1 夜。`,
+  );
   games.set(game.id, game);
   return game;
 }
@@ -226,9 +311,13 @@ export function deleteGame(id) {
 
 /** 对外可见状态（观战：展示身份便于演示） */
 export function toPublicState(game) {
+  const playerCount = game.playerCount ?? game.players.length;
   return {
     id: game.id,
     board: game.board,
+    boardDesc: game.boardDesc ?? null,
+    playerCount,
+    modelId: game.modelId ?? "doubao",
     phase: game.phase,
     day: game.day,
     night: game.night,
@@ -242,6 +331,7 @@ export function toPublicState(game) {
       revealed: p.revealed,
       canVote: p.canVote,
       isSheriff: game.sheriffId === p.id,
+      modelId: p.modelId ?? game.modelId ?? "doubao",
     })),
     witch: { ...game.witch },
     seerChecks: game.seerChecks,
@@ -766,13 +856,18 @@ export function resolveSheriffVote(game) {
   return { ballot, tally, sheriffId: null, pk: true, pkCandidates: top };
 }
 
+function seatCount(game) {
+  return game.playerCount ?? game.players.length;
+}
+
 /** 按座位环找下一个存活玩家 */
 function nextAliveFrom(game, fromId, direction) {
+  const n = seatCount(game);
   let id = fromId;
-  for (let i = 0; i < PLAYER_COUNT; i++) {
+  for (let i = 0; i < n; i++) {
     id += direction;
-    if (id > PLAYER_COUNT) id = 1;
-    if (id < 1) id = PLAYER_COUNT;
+    if (id > n) id = 1;
+    if (id < 1) id = n;
     const p = game.players.find((x) => x.id === id);
     if (p?.alive) return id;
   }
@@ -780,9 +875,10 @@ function nextAliveFrom(game, fromId, direction) {
 }
 
 function buildOrderedSpeechQueue(game, startId, direction) {
+  const n = seatCount(game);
   const queue = [];
   let cur = startId;
-  for (let i = 0; i < PLAYER_COUNT && cur != null; i++) {
+  for (let i = 0; i < n && cur != null; i++) {
     if (!queue.includes(cur)) queue.push(cur);
     const next = nextAliveFrom(game, cur, direction);
     if (next == null || next === startId) break;
@@ -1139,7 +1235,7 @@ function mentionScores(game, excludeId, kindFilter = "all") {
     const matches = s.text.match(/(\d{1,2})\s*号/g) || [];
     for (const m of matches) {
       const id = Number(m.replace(/\D/g, ""));
-      if (id >= 1 && id <= 12 && id !== excludeId) {
+      if (id >= 1 && id <= seatCount(game) && id !== excludeId) {
         scores[id] = (scores[id] || 0) + 1;
       }
     }
@@ -1204,6 +1300,9 @@ export function buildSpeechContext(game, playerId) {
     night: game.night,
     phase: game.phase,
     speechKind: kind,
+    board: game.board ?? "预女猎白",
+    boardDesc: game.boardDesc ?? "",
+    playerCount: seatCount(game),
     self: {
       id: player.id,
       role: player.role,

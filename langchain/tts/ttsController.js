@@ -1,7 +1,11 @@
 import ttsService from './ttsService.js';
 
 export const ttsController = {
-  /** 流式返回音频（边生成边推送） */
+  /**
+   * 返回整段音频。
+   * 不再边生成边推送：一旦推送开始就无法再改状态码，中途断流只能静默 end，
+   * 客户端会收到「HTTP 200 + 半截 MP3」并把它当完整音频播放。
+   */
   async streamAudio(req, res) {
     try {
       const { text, voice = 'female', speed = 1.0 } = req.body ?? {};
@@ -18,36 +22,26 @@ export const ttsController = {
         return res.status(400).json({ error: '单次文本请控制在 5000 字以内' });
       }
 
-      const stream = await ttsService.textToStream(trimmed, voice, Number(speed) || 1.0);
+      const audio = await ttsService.textToBuffer(
+        trimmed,
+        voice,
+        Number(speed) || 1.0,
+      );
 
-      let started = false;
-      for await (const chunk of stream) {
-        if (chunk.type === 'audio' && chunk.data) {
-          if (!started) {
-            started = true;
-            res.status(200);
-            res.setHeader('Content-Type', 'audio/mpeg');
-            res.setHeader('Cache-Control', 'no-cache');
-          }
-          res.write(chunk.data);
-        }
-      }
-
-      if (!started) {
+      res.setHeader('Content-Type', 'audio/mpeg');
+      res.setHeader('Content-Length', audio.length);
+      res.setHeader('Cache-Control', 'no-cache');
+      res.send(audio);
+    } catch (error) {
+      console.error('音频生成失败:', error);
+      const message = error?.message ?? '';
+      if (message.includes('未生成到音频数据')) {
         return res.status(502).json({ error: '未生成到音频数据' });
       }
-
-      res.end();
-    } catch (error) {
-      console.error('流式音频生成失败:', error);
-      if (!res.headersSent) {
-        const msg = error?.message?.includes('超时')
-          ? '语音服务连接超时（需能访问微软 Edge TTS，可在 .env 设置 EDGE_TTS_PROXY）'
-          : '语音生成失败';
-        res.status(500).json({ error: msg });
-      } else {
-        res.end();
-      }
+      const msg = message.includes('超时')
+        ? '语音服务连接超时（需能访问微软 Edge TTS，可在 .env 设置 EDGE_TTS_PROXY）'
+        : '语音生成失败';
+      res.status(500).json({ error: msg });
     }
   },
 

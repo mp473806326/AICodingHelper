@@ -1,19 +1,32 @@
 /**
- * 狼人杀 AI：人物发言使用豆包模型
+ * 狼人杀 AI：人物发言（可选模型）
  * 支持：警长竞选发言 / PK / 白天发言
  */
 
 import { HumanMessage, SystemMessage } from "@langchain/core/messages";
-import { createDoubaoChatModel } from "../models/doubao.js";
 import { buildSpeechContext, ROLE_CN } from "./game.js";
+import { createSpeechChatModel } from "./speechModels.js";
 
-let chatModel = null;
+/** modelId → 已创建的 chat model */
+const chatModelCache = new Map();
 
-function getModel() {
-  if (!chatModel) {
-    chatModel = createDoubaoChatModel({ temperature: 0.9 });
+/** 单次发言不值得让整局流程干等，超时后走重试与兜底 */
+const INVOKE_TIMEOUT_MS = 30000;
+const MAX_ATTEMPTS = 2;
+
+function getModel(modelId) {
+  const id = modelId || "doubao";
+  if (!chatModelCache.has(id)) {
+    chatModelCache.set(
+      id,
+      createSpeechChatModel(id, {
+        temperature: 0.9,
+        timeout: INVOKE_TIMEOUT_MS,
+        maxRetries: 1,
+      }),
+    );
   }
-  return chatModel;
+  return chatModelCache.get(id);
 }
 
 function normalizeText(content) {
@@ -36,7 +49,10 @@ function normalizeText(content) {
 }
 
 function buildSystemPrompt(ctx) {
-  const roleLine = `你是狼人杀「预女猎白」12人局里的 ${ctx.self.id} 号玩家，真实身份是【${ctx.self.roleCn}】（${ctx.self.camp === "evil" ? "狼人阵营" : "好人阵营"}）。`;
+  const boardLabel = ctx.boardDesc
+    ? `「${ctx.board}」${ctx.playerCount}人局（${ctx.boardDesc}）`
+    : `「${ctx.board}」${ctx.playerCount}人局`;
+  const roleLine = `你是狼人杀${boardLabel}里的 ${ctx.self.id} 号玩家，真实身份是【${ctx.self.roleCn}】（${ctx.self.camp === "evil" ? "狼人阵营" : "好人阵营"}）。`;
 
   const isSheriffPhase =
     ctx.speechKind === "sheriff" || ctx.speechKind === "sheriff_pk";
@@ -53,6 +69,7 @@ ${lengthRule}
 4. 不要直接说出自己的真实身份，除非你是预言家在报验、或白痴已翻牌、或按策略悍跳/半跳/诈身份。
 5. 可以点名座位号讨论；结合昨夜死讯与前面玩家发言站边。
 6. 只输出发言正文，不要加「发言：」前缀或引号。
+7. 仅讨论本板实际存在的角色，不要编造板子里没有的身份（例如本局无白痴就不要提白痴翻牌）。
 `.trim();
 
   let phaseExtra = "";
@@ -150,25 +167,45 @@ function buildUserPrompt(ctx) {
   ].join("\n");
 }
 
+function stripSpeechPrefix(text) {
+  return text
+    .replace(/^[\d一二三四五六七八九十]+号[:：\s]*/u, "")
+    .replace(/^发言[:：\s]*/u, "");
+}
+
 /**
- * 用豆包生成指定玩家发言
+ * 用选定模型生成指定玩家发言。
+ * 模型报错/超时不向上抛：一天有十余次连续调用，任何一次失败都会打断整局自动流程，
+ * 宁可这一位用兜底文案也要让流程走下去。
  * @returns {Promise<string>}
  */
 export async function generateSpeechWithDoubao(game, playerId) {
   const ctx = buildSpeechContext(game, playerId);
-  const model = getModel();
-  const result = await model.invoke([
+  const player = game.players.find((p) => p.id === playerId);
+  const modelId = player?.modelId || game.modelId || "doubao";
+  const messages = [
     new SystemMessage(buildSystemPrompt(ctx)),
     new HumanMessage(buildUserPrompt(ctx)),
-  ]);
+  ];
 
-  let text = normalizeText(result.content);
-  text = text.replace(/^[\d一二三四五六七八九十]+号[:：\s]*/u, "");
-  text = text.replace(/^发言[:：\s]*/u, "");
-  if (!text) {
-    text = fallbackSpeech(ctx);
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      const result = await getModel(modelId).invoke(messages);
+      const text = stripSpeechPrefix(normalizeText(result.content));
+      if (text) return text;
+      console.warn(
+        `${playerId} 号（${modelId}）发言返回空文本（第 ${attempt} 次）`,
+      );
+    } catch (error) {
+      console.warn(
+        `${playerId} 号（${modelId}）发言生成失败（第 ${attempt} 次）:`,
+        error?.message ?? error,
+      );
+    }
   }
-  return text;
+
+  console.warn(`${playerId} 号（${modelId}）发言改用兜底文案`);
+  return fallbackSpeech(ctx);
 }
 
 function fallbackSpeech(ctx) {

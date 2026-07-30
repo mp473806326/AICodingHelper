@@ -8,6 +8,48 @@ const VOICE_CONFIG = {
 };
 
 const CONNECT_TIMEOUT_MS = 8000;
+/** 断流是偶发的，整段重合成一次通常就能拿到完整音频 */
+const MAX_ATTEMPTS = 2;
+const RETRY_BACKOFF_MS = 500;
+/**
+ * Edge TTS 并发一高就整批连接超时（实测 6 并发全通过、12 并发全失败），
+ * 服务端排队远比让请求一起撞上去再全军覆没要好。
+ */
+const MAX_CONCURRENT = 4;
+
+/** 简易信号量：超出并发的调用排队等待，不占用上游连接 */
+class Semaphore {
+  constructor(limit) {
+    this.limit = limit;
+    this.active = 0;
+    this.waiting = [];
+  }
+
+  acquire() {
+    if (this.active < this.limit) {
+      this.active += 1;
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => {
+      this.waiting.push(() => {
+        this.active += 1;
+        resolve();
+      });
+    });
+  }
+
+  release() {
+    this.active -= 1;
+    const next = this.waiting.shift();
+    if (next) next();
+  }
+}
+
+const gate = new Semaphore(MAX_CONCURRENT);
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 /** 可选代理：EDGE_TTS_PROXY > HTTPS_PROXY > HTTP_PROXY（国内访问微软 TTS 常需代理） */
 function resolveProxy() {
@@ -41,27 +83,32 @@ async function* withConnectTimeout(stream, ms) {
   const iter = stream[Symbol.asyncIterator]();
   let first = true;
 
-  while (true) {
-    let timer;
-    try {
-      const next = first
-        ? await Promise.race([
-            iter.next(),
-            new Promise((_, reject) => {
-              timer = setTimeout(
-                () => reject(new Error('TTS 连接超时，请检查网络或配置 EDGE_TTS_PROXY')),
-                ms,
-              );
-            }),
-          ])
-        : await iter.next();
+  try {
+    while (true) {
+      let timer;
+      try {
+        const next = first
+          ? await Promise.race([
+              iter.next(),
+              new Promise((_, reject) => {
+                timer = setTimeout(
+                  () => reject(new Error('TTS 连接超时，请检查网络或配置 EDGE_TTS_PROXY')),
+                  ms,
+                );
+              }),
+            ])
+          : await iter.next();
 
-      if (next.done) break;
-      first = false;
-      yield next.value;
-    } finally {
-      if (timer) clearTimeout(timer);
+        if (next.done) break;
+        first = false;
+        yield next.value;
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
     }
+  } finally {
+    // 超时/中断时关闭底层连接。这里不能 await：连接已经卡住时 return() 同样不会 settle
+    void Promise.resolve(iter.return?.()).catch(() => {});
   }
 }
 
@@ -92,6 +139,48 @@ class TTSService {
   }
 
   /**
+   * 完整合成一段音频。中途断流会抛错而不是返回已收到的部分，
+   * 避免调用方把半截音频当成功结果播放（听感上就是念一半突然停）。
+   * @param {string} text
+   * @param {string} voice
+   * @param {number} speed
+   * @returns {Promise<Buffer>}
+   */
+  async textToBuffer(text, voice = 'female', speed = 1.0) {
+    let lastError = null;
+
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      await gate.acquire();
+      try {
+        const stream = await this.textToStream(text, voice, speed);
+        const chunks = [];
+        for await (const chunk of stream) {
+          if (chunk.type === 'audio' && chunk.data) {
+            chunks.push(chunk.data);
+          }
+        }
+        if (!chunks.length) {
+          throw new Error('未生成到音频数据');
+        }
+        return Buffer.concat(chunks);
+      } catch (error) {
+        lastError = error;
+        if (attempt < MAX_ATTEMPTS) {
+          console.warn(`TTS 合成失败，重试 ${attempt}/${MAX_ATTEMPTS - 1}:`, error?.message);
+        }
+      } finally {
+        gate.release();
+      }
+
+      if (attempt < MAX_ATTEMPTS) {
+        await sleep(RETRY_BACKOFF_MS);
+      }
+    }
+
+    throw lastError ?? new Error('语音合成失败');
+  }
+
+  /**
    * 批量转换：将多段文本按角色语音合成后合并
    * @param {Array<{text: string, voice?: string, speed?: number}>} segments
    * @returns {Promise<Buffer>}
@@ -100,22 +189,9 @@ class TTSService {
     const audioBuffers = [];
 
     for (const segment of segments) {
-      const stream = await this.textToStream(
-        segment.text,
-        segment.voice,
-        segment.speed ?? 1.0,
+      audioBuffers.push(
+        await this.textToBuffer(segment.text, segment.voice, segment.speed ?? 1.0),
       );
-      const chunks = [];
-
-      for await (const chunk of stream) {
-        if (chunk.type === 'audio' && chunk.data) {
-          chunks.push(chunk.data);
-        }
-      }
-
-      if (chunks.length) {
-        audioBuffers.push(Buffer.concat(chunks));
-      }
     }
 
     return Buffer.concat(audioBuffers);

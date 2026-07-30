@@ -110,6 +110,8 @@ export function createDoubaoChatModel(options = {}) {
   return new ChatOpenAI({
     model: options.model || DEFAULT_DOUBAO_MODEL,
     temperature: options.temperature ?? 0.85,
+    timeout: options.timeout,
+    maxRetries: options.maxRetries,
     apiKey: process.env.DOUBAO_API_KEY || process.env.ARK_API_KEY,
     configuration: {
       baseURL: DOUBAO_BASE_URL,

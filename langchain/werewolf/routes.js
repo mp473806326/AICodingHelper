@@ -23,14 +23,18 @@ const SPEAK_PHASES = new Set([
 ]);
 
 export function registerWerewolfRoutes(app) {
-  /** 开新局（固定 12 人预女猎白） */
-  app.post("/werewolf/games", (_req, res) => {
+  /** 开新局：body 可选 { playerCount, model, playerModels: string[] } */
+  app.post("/werewolf/games", (req, res) => {
     try {
-      const game = createGame();
+      const playerCount = Number(req.body?.playerCount) || 12;
+      const modelId = req.body?.model || req.body?.modelId || "doubao";
+      const playerModels = req.body?.playerModels;
+      const game = createGame({ playerCount, modelId, playerModels });
       res.json({ game: toPublicState(game) });
     } catch (err) {
       console.error(err);
-      res.status(500).json({ error: err.message ?? "创建对局失败" });
+      const status = /不支持的人数|未知发言模型/.test(err.message) ? 400 : 500;
+      res.status(status).json({ error: err.message ?? "创建对局失败" });
     }
   });
 
