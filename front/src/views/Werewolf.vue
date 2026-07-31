@@ -54,6 +54,7 @@ type Phase =
   | 'lobby'
   | 'night'
   | 'dawn'
+  | 'last_words'
   | 'sheriff_speech'
   | 'sheriff_vote'
   | 'sheriff_pk'
@@ -61,7 +62,7 @@ type Phase =
   | 'day_vote'
   | 'ended'
 type Camp = 'good' | 'evil'
-type SpeechKind = 'day' | 'sheriff' | 'sheriff_pk'
+type SpeechKind = 'day' | 'sheriff' | 'sheriff_pk' | 'last_words'
 
 interface Player {
   id: number
@@ -141,7 +142,12 @@ const BOARD_OPTIONS: BoardOption[] = [
 const MODEL_STORAGE_KEY = 'werewolf-player-models'
 const BOARD_STORAGE_KEY = 'werewolf-selected-board'
 
-const SPEECH_PHASES = new Set<Phase>(['day_speech', 'sheriff_speech', 'sheriff_pk'])
+const SPEECH_PHASES = new Set<Phase>([
+  'last_words',
+  'day_speech',
+  'sheriff_speech',
+  'sheriff_pk',
+])
 
 const game = ref<GameState | null>(null)
 const loading = ref(false)
@@ -286,8 +292,8 @@ function sleep(ms: number) {
 const judgeVoice = ref<VoiceId>('female')
 
 interface QueuePlayItem {
-  /** judge=法官播报；speech=玩家发言正文 */
-  kind: 'judge' | 'speech'
+  /** judge=法官播报；speech=玩家发言正文；phase_commit=播到此处再落地 UI 阶段 */
+  kind: 'judge' | 'speech' | 'phase_commit'
   text: string
   voice: VoiceId
   key: string
@@ -295,6 +301,8 @@ interface QueuePlayItem {
   audioReady: Promise<ArrayBuffer | null>
   /** 座位高亮；法官流程播报为 null */
   highlightPlayerId: number | null
+  /** 仅 phase_commit：按播放进度落地的流程阶段快照 */
+  commitGame?: GameState
 }
 
 /** 连发+朗读：已生成且已发起 TTS 预取的待播队列 */
@@ -304,8 +312,15 @@ const playbackSpeakerId = ref<number | null>(null)
 const playPipelineRunning = ref(false)
 /** 清空/停止时递增，丢弃进行中的预取播放 */
 let playPipelineEpoch = 0
-/** 服务端已进入投票等阶段，等语音队列播完再应用到 UI */
-const pendingGameAfterPlay = ref<GameState | null>(null)
+/**
+ * 服务端最新状态（API 预取以此为准，可超前于播放）。
+ * game.phase 等展示字段跟播放队列里的 phase_commit 走。
+ */
+const prefetchGame = ref<GameState | null>(null)
+/** 播放队列中尚有未落地的阶段切换（用于禁用手动夜/投票按钮） */
+const hasPendingPhaseCommit = computed(() =>
+  speechPlayQueue.value.some((item) => item.kind === 'phase_commit'),
+)
 
 onUnmounted(() => {
   autoPlay.value = false
@@ -319,6 +334,7 @@ const phaseLabel = computed(() => {
     lobby: '准备中',
     night: '夜晚行动',
     dawn: '天亮公布',
+    last_words: '遗言',
     sheriff_speech: '警长竞选·上警发言',
     sheriff_vote: '警长竞选·投票',
     sheriff_pk: '警长竞选·PK',
@@ -331,11 +347,7 @@ const phaseLabel = computed(() => {
 
 const isSpeechPhase = computed(() => {
   if (!game.value) return false
-  return (
-    game.value.phase === 'day_speech' ||
-    game.value.phase === 'sheriff_speech' ||
-    game.value.phase === 'sheriff_pk'
-  )
+  return SPEECH_PHASES.has(game.value.phase)
 })
 
 const isVotePhase = computed(() => {
@@ -374,19 +386,26 @@ const todaySpeeches = computed(() => {
   const phase = game.value.phase
   return game.value.speeches.filter((s) => {
     if (s.day !== day) return false
+    if (phase === 'last_words') {
+      return s.kind === 'last_words'
+    }
     if (phase === 'sheriff_speech' || phase === 'sheriff_vote') {
-      return s.kind === 'sheriff'
+      return s.kind === 'sheriff' || s.kind === 'last_words'
     }
     if (phase === 'sheriff_pk') {
-      return s.kind === 'sheriff' || s.kind === 'sheriff_pk'
+      return (
+        s.kind === 'sheriff' ||
+        s.kind === 'sheriff_pk' ||
+        s.kind === 'last_words'
+      )
     }
-    // 白天：展示今日全部（含竞选回顾）
+    // 白天：展示今日全部（含遗言/竞选回顾）
     return true
   })
 })
 
 /** 战报只保留流程信息，过滤玩家发言正文（「N 号：…」） */
-const SPEECH_LOG_RE = /^(【上警】|【PK】)?\d+ 号：/
+const SPEECH_LOG_RE = /^(【上警】|【PK】|【遗言】)?\d+ 号：/
 const flowLogs = computed(() => {
   if (!game.value) return []
   return game.value.logs.filter((item) => !SPEECH_LOG_RE.test(item.msg))
@@ -394,6 +413,7 @@ const flowLogs = computed(() => {
 
 const speechPanelTitle = computed(() => {
   if (!game.value) return '发言'
+  if (game.value.phase === 'last_words') return '遗言'
   if (game.value.phase === 'sheriff_speech') return '上警发言'
   if (game.value.phase === 'sheriff_pk') return 'PK 发言'
   if (game.value.phase === 'sheriff_vote') return '竞选发言记录'
@@ -404,11 +424,13 @@ const speakButtonLabel = computed(() => {
   if (!game.value) return ''
   const id = currentSpeakerId.value
   if (speaking.value) {
+    if (game.value.phase === 'last_words') return `豆包生成 ${id} 号遗言…`
     if (game.value.phase === 'sheriff_speech') return `豆包生成 ${id} 号上警发言…`
     if (game.value.phase === 'sheriff_pk') return `豆包生成 ${id} 号 PK 发言…`
     return `豆包生成 ${id} 号发言…`
   }
   if (id == null) return '发言已结束'
+  if (game.value.phase === 'last_words') return `下一位遗言（${id}号）`
   if (game.value.phase === 'sheriff_speech') return `下一位上警发言（${id}号）`
   if (game.value.phase === 'sheriff_pk') return `下一位 PK（${id}号）`
   return `下一位发言（${id}号）`
@@ -458,16 +480,17 @@ function errMsg(err: unknown) {
 }
 
 function clearSpeechPipeline(opts?: { applyPending?: boolean }) {
+  const pendingCommits = opts?.applyPending
+    ? speechPlayQueue.value.filter((item) => item.kind === 'phase_commit' && item.commitGame)
+    : []
   playPipelineEpoch += 1
   speechPlayQueue.value = []
   playbackSpeakerId.value = null
   playPipelineRunning.value = false
-  if (opts?.applyPending && pendingGameAfterPlay.value) {
-    game.value = pendingGameAfterPlay.value
-    pendingGameAfterPlay.value = null
+  if (pendingCommits.length) {
+    const last = pendingCommits[pendingCommits.length - 1]!
+    applyPhaseCommit(last.commitGame!)
     autoSpeak.value = false
-  } else {
-    pendingGameAfterPlay.value = null
   }
 }
 
@@ -493,6 +516,7 @@ async function startGame() {
       playerModels: playerModels.value,
     })
     game.value = data.game
+    prefetchGame.value = data.game
     if (autoVoice.value) {
       enqueueJudgeLines(newFlowLogMessages([], data.game.logs))
     }
@@ -503,54 +527,119 @@ async function startGame() {
   }
 }
 
+/** API 预取用的最新服务端状态 */
+function logicalGame(): GameState | null {
+  return prefetchGame.value ?? game.value
+}
+
+/** 合并战报/发言等缓存字段，不改展示用的 phase / day / night */
+function mergeGameContent(target: GameState, nextGame: GameState): GameState {
+  return {
+    ...target,
+    logs: nextGame.logs,
+    speeches: nextGame.speeches,
+    players: nextGame.players,
+    aliveCount: nextGame.aliveCount,
+    lastNightDeaths: nextGame.lastNightDeaths,
+    lastExile: nextGame.lastExile,
+    witch: nextGame.witch,
+    votes: nextGame.votes,
+    voteTally: nextGame.voteTally,
+    winner: nextGame.winner,
+    winnerReason: nextGame.winnerReason,
+    sheriffId: nextGame.sheriffId,
+    sheriffDone: nextGame.sheriffDone,
+    sheriffRunners: nextGame.sheriffRunners,
+    sheriffBallot: nextGame.sheriffBallot,
+    sheriffWithdrawn: nextGame.sheriffWithdrawn,
+    sheriffPkCandidates: nextGame.sheriffPkCandidates,
+    sheriffElectResult: nextGame.sheriffElectResult,
+  }
+}
+
+/** 播放进度追上时，只落地流程阶段，保留已预取的发言缓存 */
+function applyPhaseCommit(commit: GameState) {
+  if (!game.value) {
+    game.value = commit
+    return
+  }
+  const sameSpeechPhase =
+    SPEECH_PHASES.has(commit.phase) && game.value.phase === commit.phase
+  game.value = {
+    ...game.value,
+    phase: commit.phase,
+    day: commit.day,
+    night: commit.night,
+    speechQueue: commit.speechQueue,
+    speechKind: commit.speechKind,
+    speechOrderMode: commit.speechOrderMode,
+    speechOrderCn: commit.speechOrderCn,
+    speechIndex: sameSpeechPhase
+      ? Math.max(game.value.speechIndex, commit.speechIndex)
+      : commit.speechIndex,
+    sheriffId: commit.sheriffId,
+    sheriffDone: commit.sheriffDone,
+    sheriffRunners: commit.sheriffRunners,
+    sheriffBallot: commit.sheriffBallot,
+    sheriffWithdrawn: commit.sheriffWithdrawn,
+    sheriffPkCandidates: commit.sheriffPkCandidates,
+    sheriffElectResult: commit.sheriffElectResult,
+    votes: commit.votes,
+    voteTally: commit.voteTally,
+    lastNightDeaths: commit.lastNightDeaths,
+    lastExile: commit.lastExile,
+    aliveCount: commit.aliveCount,
+    players: commit.players,
+    winner: commit.winner,
+    winnerReason: commit.winnerReason,
+  }
+}
+
+function enqueuePhaseCommit(nextGame: GameState) {
+  speechPlayQueue.value.push({
+    kind: 'phase_commit',
+    text: '',
+    voice: judgeVoice.value,
+    key: `phase-${nextGame.phase}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    audioReady: Promise.resolve(null),
+    highlightPlayerId: null,
+    commitGame: nextGame,
+  })
+  void drainPlayQueue()
+}
+
 /**
- * 接口结果先写入前端缓存；开启朗读时阶段切换等语音队列播完再落地。
- * 战报/发言/死亡等展示字段可提前合并，流程字段（phase 等）跟播放走。
+ * 接口结果先写入前端缓存；开启朗读时阶段切换跟播放队列走。
+ * 战报/发言等可提前合并；phase 等流程字段等播到 phase_commit 再落地。
+ * 这样夜间播报未完即可预取警上，警上未播完即可预取投票与警下。
  */
 function applyGameWithVoice(nextGame: GameState, judgeLines: string[]) {
+  prefetchGame.value = nextGame
   const lines = judgeLines.map((t) => t.trim()).filter(Boolean)
   if (!autoVoice.value || !lines.length) {
     game.value = nextGame
     return
   }
 
-  pendingGameAfterPlay.value = nextGame
   if (game.value) {
-    game.value = {
-      ...game.value,
-      logs: nextGame.logs,
-      speeches: nextGame.speeches,
-      players: nextGame.players,
-      aliveCount: nextGame.aliveCount,
-      lastNightDeaths: nextGame.lastNightDeaths,
-      lastExile: nextGame.lastExile,
-      witch: nextGame.witch,
-      votes: nextGame.votes,
-      voteTally: nextGame.voteTally,
-      winner: nextGame.winner,
-      winnerReason: nextGame.winnerReason,
-      sheriffId: nextGame.sheriffId,
-      sheriffDone: nextGame.sheriffDone,
-      sheriffRunners: nextGame.sheriffRunners,
-      sheriffBallot: nextGame.sheriffBallot,
-      sheriffWithdrawn: nextGame.sheriffWithdrawn,
-      sheriffPkCandidates: nextGame.sheriffPkCandidates,
-      sheriffElectResult: nextGame.sheriffElectResult,
-    }
+    game.value = mergeGameContent(game.value, nextGame)
   } else {
     game.value = nextGame
   }
   enqueueJudgeLines(lines)
+  enqueuePhaseCommit(nextGame)
 }
 
 async function runNight() {
-  if (!game.value || loading.value || pendingGameAfterPlay.value) return
+  const g = logicalGame()
+  if (!g || loading.value || speaking.value) return
+  if (g.phase !== 'night') return
   loading.value = true
   error.value = ''
   try {
-    const prevLogs = game.value.logs
+    const prevLogs = game.value?.logs ?? g.logs
     const { data } = await axios.post<{ game: GameState }>(
-      `/api/werewolf/games/${game.value.id}/night`,
+      `/api/werewolf/games/${g.id}/night`,
     )
     const lines = newFlowLogMessages(prevLogs, data.game.logs)
     applyGameWithVoice(data.game, lines)
@@ -591,6 +680,7 @@ function newFlowLogMessages(
 }
 
 function speechIntroText(speech: Speech) {
+  if (speech.kind === 'last_words') return `请${speech.playerId}号玩家发表遗言。`
   if (speech.kind === 'sheriff') return `请${speech.playerId}号玩家进行上警发言。`
   if (speech.kind === 'sheriff_pk') return `请${speech.playerId}号玩家进行PK发言。`
   return `请${speech.playerId}号玩家发言。`
@@ -677,19 +767,14 @@ async function drainPlayQueue() {
     while (speechPlayQueue.value.length > 0) {
       if (epoch !== playPipelineEpoch) break
       const item = speechPlayQueue.value.shift()!
+      if (item.kind === 'phase_commit') {
+        if (item.commitGame) applyPhaseCommit(item.commitGame)
+        continue
+      }
       playbackSpeakerId.value = item.highlightPlayerId
       await playQueuedItem(item, epoch)
       if (epoch !== playPipelineEpoch) break
       playbackSpeakerId.value = null
-    }
-    if (
-      epoch === playPipelineEpoch &&
-      pendingGameAfterPlay.value &&
-      speechPlayQueue.value.length === 0
-    ) {
-      game.value = pendingGameAfterPlay.value
-      pendingGameAfterPlay.value = null
-      autoSpeak.value = false
     }
   } finally {
     if (epoch === playPipelineEpoch) {
@@ -724,16 +809,23 @@ function enqueueSpeechPlay(speech: Speech) {
 }
 
 /**
- * 发言接口返回：文本立刻缓存；仍在发言阶段则同步进度。
- * 阶段已切走时，发言列表先合并，投票等阶段等语音播完再应用。
+ * 发言接口返回：文本立刻缓存。
+ * 展示 phase 仍落后于播放时只合并内容；同阶段则可同步 speechIndex。
+ * 阶段切走时走 applyGameWithVoice（法官词 + phase_commit）。
  */
 function applySpeechProgress(nextGame: GameState, stillSpeechPhase: boolean) {
+  prefetchGame.value = nextGame
   const prevLogs = game.value?.logs ?? []
   const judgeLines = newFlowLogMessages(prevLogs, nextGame.logs)
 
   if (stillSpeechPhase) {
-    // 发言正文已缓存；speechIndex 可超前，座位高亮跟 playbackSpeakerId
-    game.value = nextGame
+    if (!game.value || game.value.phase === nextGame.phase || !autoVoice.value) {
+      // 展示已进入本发言阶段（或未开朗读）：可同步进度
+      game.value = nextGame
+    } else {
+      // 仍在播上一阶段（如夜间），只缓存发言正文，不抢先改 phase
+      game.value = mergeGameContent(game.value, nextGame)
+    }
     if (autoVoice.value && judgeLines.length) {
       enqueueJudgeLines(judgeLines)
     }
@@ -744,8 +836,15 @@ function applySpeechProgress(nextGame: GameState, stillSpeechPhase: boolean) {
 }
 
 async function nextSpeech() {
-  if (!game.value || speaking.value || loading.value) return
-  if (!isSpeechPhase.value) return
+  if (speaking.value || loading.value) return
+  const g = logicalGame()
+  if (!g) return
+
+  // 自动预取跟服务端阶段；手动操作跟当前展示阶段
+  const canSpeak = autoPlay.value || autoSpeak.value
+    ? SPEECH_PHASES.has(g.phase)
+    : isSpeechPhase.value
+  if (!canSpeak) return
 
   speaking.value = true
   error.value = ''
@@ -753,9 +852,10 @@ async function nextSpeech() {
     const { data } = await axios.post<{
       game: GameState
       speech?: Speech
-    }>(`/api/werewolf/games/${game.value.id}/speak`)
+    }>(`/api/werewolf/games/${g.id}/speak`)
 
     const stillSpeechPhase = SPEECH_PHASES.has(data.game.phase)
+    prefetchGame.value = data.game
 
     if (autoVoice.value && data.speech?.text) {
       // 文本 + TTS 预取入队；连发时继续请求下一位（播放与请求并行）
@@ -770,11 +870,10 @@ async function nextSpeech() {
       return
     }
 
-    const prevLogs = game.value.logs
+    const prevLogs = game.value?.logs ?? g.logs
     const lines = newFlowLogMessages(prevLogs, data.game.logs)
     if (stillSpeechPhase) {
-      game.value = data.game
-      if (autoVoice.value && lines.length) enqueueJudgeLines(lines)
+      applySpeechProgress(data.game, true)
     } else {
       applyGameWithVoice(data.game, lines)
     }
@@ -794,14 +893,16 @@ async function nextSpeech() {
 }
 
 async function runVote() {
-  if (!game.value || loading.value || pendingGameAfterPlay.value) return
+  const g = logicalGame()
+  if (!g || loading.value || speaking.value) return
+  if (g.phase !== 'sheriff_vote' && g.phase !== 'day_vote') return
   loading.value = true
   error.value = ''
   autoSpeak.value = false
   try {
-    const prevLogs = game.value.logs
+    const prevLogs = game.value?.logs ?? g.logs
     const { data } = await axios.post<{ game: GameState }>(
-      `/api/werewolf/games/${game.value.id}/vote`,
+      `/api/werewolf/games/${g.id}/vote`,
     )
     const lines = newFlowLogMessages(prevLogs, data.game.logs)
     applyGameWithVoice(data.game, lines)
@@ -813,26 +914,13 @@ async function runVote() {
   }
 }
 
-/** 等待请求/朗读结束，再进入下一自动步骤 */
-async function waitForAutoIdle(token: number): Promise<boolean> {
+/** 只等 API 空闲；播放可并行，内容预取不阻塞 */
+async function waitForPrefetchIdle(token: number): Promise<boolean> {
   for (;;) {
     if (!autoPlay.value || token !== autoPlayToken) return false
     if (loading.value || speaking.value) {
       await sleep(80)
       continue
-    }
-    if (
-      speechPlayQueue.value.length > 0 ||
-      playPipelineRunning.value ||
-      voicePlaying.value
-    ) {
-      await sleep(80)
-      continue
-    }
-    if (pendingGameAfterPlay.value) {
-      game.value = pendingGameAfterPlay.value
-      pendingGameAfterPlay.value = null
-      autoSpeak.value = false
     }
     return true
   }
@@ -842,11 +930,20 @@ async function runAutoPlayLoop() {
   const token = ++autoPlayToken
   autoPlay.value = true
   while (autoPlay.value && token === autoPlayToken) {
-    const idle = await waitForAutoIdle(token)
+    const idle = await waitForPrefetchIdle(token)
     if (!idle) break
 
-    const g = game.value
+    const g = logicalGame()
     if (!g || g.phase === 'ended') {
+      // 终局：若仍有播报在播，等队列自然播完即可
+      if (
+        speechPlayQueue.value.length > 0 ||
+        playPipelineRunning.value ||
+        voicePlaying.value
+      ) {
+        await sleep(80)
+        continue
+      }
       stopAutoPlay()
       break
     }
@@ -902,6 +999,7 @@ async function toggleAutoSpeak() {
 function resetLocal() {
   ttsService.stopPlay()
   game.value = null
+  prefetchGame.value = null
   error.value = ''
   stopAutoPlay()
   voicePlaying.value = false
@@ -924,6 +1022,7 @@ function isOnBallot(id: number) {
 }
 
 function speechKindTag(kind?: SpeechKind) {
+  if (kind === 'last_words') return '遗言'
   if (kind === 'sheriff') return '上警'
   if (kind === 'sheriff_pk') return 'PK'
   return ''
@@ -1197,10 +1296,10 @@ function speechKindTag(kind?: SpeechKind) {
           v-if="game.phase === 'night'"
           class="btn primary"
           type="button"
-          :disabled="loading || autoPlay || !!pendingGameAfterPlay"
+          :disabled="loading || autoPlay || hasPendingPhaseCommit"
           @click="runNight"
         >
-          {{ loading ? '结算中…' : pendingGameAfterPlay ? '播报中…' : '结算夜晚' }}
+          {{ loading ? '结算中…' : hasPendingPhaseCommit ? '播报中…' : '结算夜晚' }}
         </button>
 
         <template v-if="isSpeechPhase">
@@ -1275,10 +1374,10 @@ function speechKindTag(kind?: SpeechKind) {
           v-if="isVotePhase"
           class="btn primary"
           type="button"
-          :disabled="loading || autoPlay || !!pendingGameAfterPlay"
+          :disabled="loading || autoPlay || hasPendingPhaseCommit"
           @click="runVote"
         >
-          {{ pendingGameAfterPlay ? '播报中…' : voteButtonLabel }}
+          {{ hasPendingPhaseCommit ? '播报中…' : voteButtonLabel }}
         </button>
       </section>
 

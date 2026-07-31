@@ -18,11 +18,13 @@ const SPEECH_DEFAULTS = {
 };
 
 function withSpeechOpts(options = {}) {
-  return {
+  const opts = {
     temperature: options.temperature ?? SPEECH_DEFAULTS.temperature,
     timeout: options.timeout ?? SPEECH_DEFAULTS.timeout,
     maxRetries: options.maxRetries ?? SPEECH_DEFAULTS.maxRetries,
   };
+  if (options.maxTokens != null) opts.maxTokens = options.maxTokens;
+  return opts;
 }
 
 /** Writer 使用 /v1/chat，OpenAI SDK 默认走 /chat/completions */

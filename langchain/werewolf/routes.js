@@ -1,6 +1,6 @@
 /**
  * 狼人杀 HTTP 路由
- * 流程：night → (首日 sheriff_speech → sheriff_vote [→ sheriff_pk → sheriff_vote]) → day_speech → day_vote → night …
+ * 流程：night → [last_words] → (首日 sheriff…) → day_speech → day_vote → [放逐 last_words] → night …
  */
 
 import {
@@ -17,6 +17,7 @@ import {
 import { generateSpeechWithDoubao } from "./ai.js";
 
 const SPEAK_PHASES = new Set([
+  PHASE.LAST_WORDS,
   PHASE.SHERIFF_SPEECH,
   PHASE.SHERIFF_PK,
   PHASE.DAY_SPEECH,
@@ -60,7 +61,18 @@ export function registerWerewolfRoutes(app) {
         });
       }
       const result = resolveNight(game);
-      res.json({ ...result, game: toPublicState(game) });
+      // deaths 对外只报座位；刀验毒细节在 game.logs 战报里展示，发言 AI 不读 logs
+      res.json({
+        deaths: (result.deaths || []).map((d) => ({ id: d.id, name: d.name })),
+        hunterShot: result.hunterShot
+          ? {
+              hunterId: result.hunterShot.hunterId,
+              targetId: result.hunterShot.targetId,
+              skipped: result.hunterShot.skipped,
+            }
+          : null,
+        game: toPublicState(game),
+      });
     } catch (err) {
       console.error(err);
       res.status(500).json({ error: err.message ?? "夜晚结算失败" });
