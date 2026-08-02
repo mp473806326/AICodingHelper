@@ -152,7 +152,7 @@ function sanitizePublicFact(line) {
 
 /**
  * 汇总铁逻辑事实（不可被发言推翻）
- * 仅公开信息：死讯、票型、放逐亮身份、翻牌；不含法官夜间预/狼详情。
+ * 仅公开信息：死讯、票型、白痴翻牌；不含法官夜间预/狼详情。
  */
 export function buildIronFacts(game) {
   const facts = [];
@@ -181,7 +181,7 @@ export function buildIronFacts(game) {
       facts.push(
         e.flipped
           ? `上日放逐：${e.id}号亮出白痴翻牌免死。`
-          : `上日放逐：${e.id}号出局，身份【${e.roleCn}】。`,
+          : `上日放逐：${e.id}号出局。`,
       );
     }
   }
@@ -298,11 +298,11 @@ export function buildLogicTheoryBlock(ctx) {
 
   return `
 【逻辑铁则】你是${role}，胜利条件：${win}
-1. 铁逻辑=公开死讯/票型/放逐亮身份/已翻牌；软逻辑=语气站边，勿把软当铁。
+1. 铁逻辑=公开死讯/票型/白痴翻牌；软逻辑=语气站边，勿把软当铁。
 2. 单边预言家无人对跳且持续两轮→视为真预；对跳必须二选一站边。${seerLockLine}
 3. 时间轴：上轮「${lastSummary}」；改口须给理由。
 4. 禁止场外/划水骑墙；必须给出出人/保人结论。
-5. 查杀优先；票型是证据；银水慎出；死亡亮身份不可逆。
+5. 查杀优先；票型是证据；银水慎出；只有明确翻牌的身份才是公开铁事实。
 6. ${infoBarrier}
 立场锚点：站边${stance.sideWith || "待定"}；主攻${stance.attackTarget || "待定"}；保护${stance.protectTarget || "待定"}。
 发言结构：事实→逻辑→结论→提问。只输出正文。

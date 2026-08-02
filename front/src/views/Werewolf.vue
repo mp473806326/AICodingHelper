@@ -289,43 +289,61 @@ function sleep(ms: number) {
   return new Promise<void>((resolve) => setTimeout(resolve, ms))
 }
 
-const judgeVoice = ref<VoiceId>('female')
+const judgeVoice = ref<VoiceId>('xiaoxiao')
 
-interface QueuePlayItem {
-  /** judge=法官播报；speech=玩家发言正文；phase_commit=播到此处再落地 UI 阶段 */
-  kind: 'judge' | 'speech' | 'phase_commit'
+/** 两段播报之间的留白，避免上一句尾音和下一句糊在一起 */
+const STEP_GAP_MS = 260
+/**
+ * 未播语音步数上限。超过就先不发请求，
+ * 否则接口能在几十秒内把整局跑完，而语音还停在第一夜。
+ */
+const PREFETCH_AHEAD_LIMIT = 3
+
+interface TimelineStep {
+  /** judge=法官播报；speech=玩家发言正文；silent=只落地状态、不发声 */
+  kind: 'judge' | 'speech' | 'silent'
   text: string
   voice: VoiceId
   key: string
-  /** 文本就绪后立即预取，播完上一段再取结果播放 */
-  audioReady: Promise<ArrayBuffer | null>
   /** 座位高亮；法官流程播报为 null */
   highlightPlayerId: number | null
-  /** 仅 phase_commit：按播放进度落地的流程阶段快照 */
-  commitGame?: GameState
+  /**
+   * 播这一步之前落地的状态增量。
+   * 这是**唯一**推进展示状态的地方，所以进度严格跟着语音走。
+   */
+  patch: ((prev: GameState) => Partial<GameState>) | null
+  /** 文本就绪后立即预取，播完上一段再取结果播放 */
+  audioReady: Promise<ArrayBuffer | null> | null
 }
 
-/** 连发+朗读：已生成且已发起 TTS 预取的待播队列 */
-const speechPlayQueue = ref<QueuePlayItem[]>([])
+/** 按播放顺序排布的播报时间线 */
+const timeline = ref<TimelineStep[]>([])
 /** 当前正在朗读的座位号（流程高亮跟语音走） */
 const playbackSpeakerId = ref<number | null>(null)
-const playPipelineRunning = ref(false)
+const timelineRunning = ref(false)
 /** 清空/停止时递增，丢弃进行中的预取播放 */
-let playPipelineEpoch = 0
+let timelineEpoch = 0
+/** 已排进时间线的战报；用独立集合做差分，避免依赖会被改写的 game.logs */
+const narratedLogKeys = new Set<string>()
 /**
- * 服务端最新状态（API 预取以此为准，可超前于播放）。
- * game.phase 等展示字段跟播放队列里的 phase_commit 走。
+ * 服务端最新状态。只用于决定下一个请求打哪个接口，从不直接参与渲染。
  */
 const prefetchGame = ref<GameState | null>(null)
-/** 播放队列中尚有未落地的阶段切换（用于禁用手动夜/投票按钮） */
-const hasPendingPhaseCommit = computed(() =>
-  speechPlayQueue.value.some((item) => item.kind === 'phase_commit'),
+
+/** 还没播的语音步数，用来给预取限速 */
+const pendingAudioSteps = computed(
+  () => timeline.value.filter((step) => step.kind !== 'silent').length,
+)
+/** 还有播报没走完：手动按钮要等它播完再放行 */
+const timelinePending = computed(
+  () => timeline.value.length > 0 || timelineRunning.value,
 )
 
 onUnmounted(() => {
   autoPlay.value = false
   autoSpeak.value = false
   autoPlayToken += 1
+  timelineEpoch += 1
   ttsService.stopPlay()
 })
 
@@ -362,13 +380,10 @@ const currentSpeakerId = computed(() => {
   return speechQueue[speechIndex]
 })
 
-/** 座位高亮：优先当前朗读 / 待播队列，而非接口预生成进度 */
-const displaySpeakerId = computed(() => {
-  if (playbackSpeakerId.value != null) return playbackSpeakerId.value
-  const next = speechPlayQueue.value.find((item) => item.highlightPlayerId != null)
-  if (next?.highlightPlayerId != null) return next.highlightPlayerId
-  return currentSpeakerId.value
-})
+/** 座位高亮跟着正在朗读的那一步走；无朗读时才回落到展示进度 */
+const displaySpeakerId = computed(
+  () => playbackSpeakerId.value ?? currentSpeakerId.value,
+)
 
 const leftColumn = computed(() => {
   const list = game.value?.players ?? []
@@ -479,18 +494,18 @@ function errMsg(err: unknown) {
   return err instanceof Error ? err.message : '请求失败'
 }
 
-function clearSpeechPipeline(opts?: { applyPending?: boolean }) {
-  const pendingCommits = opts?.applyPending
-    ? speechPlayQueue.value.filter((item) => item.kind === 'phase_commit' && item.commitGame)
-    : []
-  playPipelineEpoch += 1
-  speechPlayQueue.value = []
+/** 停止播报：丢掉剩余语音；applyPending 时把状态一次性追平到已请求的进度 */
+function clearTimeline(opts?: { applyPending?: boolean }) {
+  const rest = timeline.value
+  timelineEpoch += 1
+  timeline.value = []
   playbackSpeakerId.value = null
-  playPipelineRunning.value = false
-  if (pendingCommits.length) {
-    const last = pendingCommits[pendingCommits.length - 1]!
-    applyPhaseCommit(last.commitGame!)
-    autoSpeak.value = false
+  timelineRunning.value = false
+  ttsService.stopPlay()
+  voicePlaying.value = false
+  playingSpeechKey.value = null
+  if (opts?.applyPending) {
+    for (const step of rest) applyStepPatch(step)
   }
 }
 
@@ -504,7 +519,8 @@ async function startGame() {
   loading.value = true
   error.value = ''
   stopAutoPlay()
-  clearSpeechPipeline()
+  clearTimeline()
+  narratedLogKeys.clear()
   try {
     ensurePlayerModels(selectedPlayerCount.value)
     ensurePlayerVoices(selectedPlayerCount.value)
@@ -515,11 +531,9 @@ async function startGame() {
       model: defaultModelId.value,
       playerModels: playerModels.value,
     })
-    game.value = data.game
-    prefetchGame.value = data.game
-    if (autoVoice.value) {
-      enqueueJudgeLines(newFlowLogMessages([], data.game.logs))
-    }
+    // 战报留空由时间线逐条揭示，避免开局播报还没念就全列出来
+    game.value = { ...data.game, logs: [] }
+    enqueueServerUpdate(data.game)
   } catch (e) {
     error.value = errMsg(e)
   } finally {
@@ -532,104 +546,6 @@ function logicalGame(): GameState | null {
   return prefetchGame.value ?? game.value
 }
 
-/** 合并战报/发言等缓存字段，不改展示用的 phase / day / night */
-function mergeGameContent(target: GameState, nextGame: GameState): GameState {
-  return {
-    ...target,
-    logs: nextGame.logs,
-    speeches: nextGame.speeches,
-    players: nextGame.players,
-    aliveCount: nextGame.aliveCount,
-    lastNightDeaths: nextGame.lastNightDeaths,
-    lastExile: nextGame.lastExile,
-    witch: nextGame.witch,
-    votes: nextGame.votes,
-    voteTally: nextGame.voteTally,
-    winner: nextGame.winner,
-    winnerReason: nextGame.winnerReason,
-    sheriffId: nextGame.sheriffId,
-    sheriffDone: nextGame.sheriffDone,
-    sheriffRunners: nextGame.sheriffRunners,
-    sheriffBallot: nextGame.sheriffBallot,
-    sheriffWithdrawn: nextGame.sheriffWithdrawn,
-    sheriffPkCandidates: nextGame.sheriffPkCandidates,
-    sheriffElectResult: nextGame.sheriffElectResult,
-  }
-}
-
-/** 播放进度追上时，只落地流程阶段，保留已预取的发言缓存 */
-function applyPhaseCommit(commit: GameState) {
-  if (!game.value) {
-    game.value = commit
-    return
-  }
-  const sameSpeechPhase =
-    SPEECH_PHASES.has(commit.phase) && game.value.phase === commit.phase
-  game.value = {
-    ...game.value,
-    phase: commit.phase,
-    day: commit.day,
-    night: commit.night,
-    speechQueue: commit.speechQueue,
-    speechKind: commit.speechKind,
-    speechOrderMode: commit.speechOrderMode,
-    speechOrderCn: commit.speechOrderCn,
-    speechIndex: sameSpeechPhase
-      ? Math.max(game.value.speechIndex, commit.speechIndex)
-      : commit.speechIndex,
-    sheriffId: commit.sheriffId,
-    sheriffDone: commit.sheriffDone,
-    sheriffRunners: commit.sheriffRunners,
-    sheriffBallot: commit.sheriffBallot,
-    sheriffWithdrawn: commit.sheriffWithdrawn,
-    sheriffPkCandidates: commit.sheriffPkCandidates,
-    sheriffElectResult: commit.sheriffElectResult,
-    votes: commit.votes,
-    voteTally: commit.voteTally,
-    lastNightDeaths: commit.lastNightDeaths,
-    lastExile: commit.lastExile,
-    aliveCount: commit.aliveCount,
-    players: commit.players,
-    winner: commit.winner,
-    winnerReason: commit.winnerReason,
-  }
-}
-
-function enqueuePhaseCommit(nextGame: GameState) {
-  speechPlayQueue.value.push({
-    kind: 'phase_commit',
-    text: '',
-    voice: judgeVoice.value,
-    key: `phase-${nextGame.phase}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-    audioReady: Promise.resolve(null),
-    highlightPlayerId: null,
-    commitGame: nextGame,
-  })
-  void drainPlayQueue()
-}
-
-/**
- * 接口结果先写入前端缓存；开启朗读时阶段切换跟播放队列走。
- * 战报/发言等可提前合并；phase 等流程字段等播到 phase_commit 再落地。
- * 这样夜间播报未完即可预取警上，警上未播完即可预取投票与警下。
- */
-function applyGameWithVoice(nextGame: GameState, judgeLines: string[]) {
-  prefetchGame.value = nextGame
-  const lines = judgeLines.map((t) => t.trim()).filter(Boolean)
-  if (!autoVoice.value || !lines.length) {
-    game.value = nextGame
-    return
-  }
-
-  if (game.value) {
-    game.value = mergeGameContent(game.value, nextGame)
-  } else {
-    game.value = nextGame
-  }
-  enqueueJudgeLines(lines)
-  enqueuePhaseCommit(nextGame)
-}
-
 async function runNight() {
   const g = logicalGame()
   if (!g || loading.value || speaking.value) return
@@ -637,12 +553,10 @@ async function runNight() {
   loading.value = true
   error.value = ''
   try {
-    const prevLogs = game.value?.logs ?? g.logs
     const { data } = await axios.post<{ game: GameState }>(
       `/api/werewolf/games/${g.id}/night`,
     )
-    const lines = newFlowLogMessages(prevLogs, data.game.logs)
-    applyGameWithVoice(data.game, lines)
+    enqueueServerUpdate(data.game)
   } catch (e) {
     error.value = errMsg(e)
     stopAutoPlay()
@@ -660,23 +574,29 @@ function voiceForPlayer(playerId: number): VoiceId {
   return playerVoices.value[idx] ?? ttsService.getVoiceBySpeaker(playerId)
 }
 
-function logKey(item: { t: number; msg: string }) {
+type LogItem = { t: number; msg: string }
+
+function logKey(item: LogItem) {
   return `${item.t}|${item.msg}`
 }
 
-/** 新增流程战报（过滤发言正文），按时间正序供法官朗读 */
-function newFlowLogMessages(
-  prevLogs: { t: number; msg: string }[],
-  nextLogs: { t: number; msg: string }[],
-): string[] {
-  const prevKeys = new Set(prevLogs.map(logKey))
-  const fresh = nextLogs.filter(
-    (item) => !prevKeys.has(logKey(item)) && !SPEECH_LOG_RE.test(item.msg),
-  )
+/**
+ * 取出还没排进时间线的战报，按发生顺序（旧→新）返回。
+ * 同一毫秒的重复文案用出现次数区分，避免被误判成已播过而漏掉。
+ */
+function collectFreshLogs(nextLogs: LogItem[]): LogItem[] {
+  const seen = new Map<string, number>()
+  const fresh: LogItem[] = []
+  for (const item of nextLogs.slice().reverse()) {
+    const base = logKey(item)
+    const nth = (seen.get(base) ?? 0) + 1
+    seen.set(base, nth)
+    const key = `${base}#${nth}`
+    if (narratedLogKeys.has(key)) continue
+    narratedLogKeys.add(key)
+    fresh.push(item)
+  }
   return fresh
-    .slice()
-    .reverse()
-    .map((item) => item.msg)
 }
 
 function speechIntroText(speech: Speech) {
@@ -686,32 +606,161 @@ function speechIntroText(speech: Speech) {
   return `请${speech.playerId}号玩家发言。`
 }
 
-function pushQueueItem(item: Omit<QueuePlayItem, 'audioReady'> & { audioReady?: Promise<ArrayBuffer | null> }) {
-  const audioReady =
-    item.audioReady ??
-    ttsService.prefetchAudio(item.text, {
-      voice: item.voice,
-      speed: ttsSpeed.value,
-    })
-  speechPlayQueue.value.push({ ...item, audioReady })
+function stepId(prefix: string) {
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
 }
 
-/** 法官播报：夜间信息、上警/退水、投票结果等 */
-function enqueueJudgeLines(texts: string[]) {
-  const lines = texts.map((t) => t.trim()).filter(Boolean)
-  if (!lines.length) return
-  for (const text of lines) {
-    pushQueueItem({
+/** 入队一步；关掉朗读时退化成 silent，走同一条落地路径 */
+function pushStep(step: Omit<TimelineStep, 'audioReady'>) {
+  const silent = step.kind === 'silent' || !autoVoice.value || !step.text.trim()
+  timeline.value.push({
+    ...step,
+    kind: silent ? 'silent' : step.kind,
+    audioReady: silent
+      ? null
+      : ttsService.prefetchAudio(step.text, {
+          voice: step.voice,
+          speed: ttsSpeed.value,
+        }),
+  })
+}
+
+/**
+ * 把一次接口结果拆成按播放顺序落地的时间线。
+ *
+ * 请求只负责生产播报步骤，不碰展示状态：每一步的状态增量都在自己播之前才生效，
+ * 末尾再补一份完整快照兜底，所以画面永远不会跑到语音前面去。
+ */
+function enqueueServerUpdate(nextGame: GameState, speech?: Speech | null) {
+  prefetchGame.value = nextGame
+
+  const fresh = collectFreshLogs(nextGame.logs)
+  // 战报是新→旧存的，揭示到某条即从它开始往后切
+  const revealLogs = (item: LogItem) =>
+    nextGame.logs.slice(nextGame.logs.indexOf(item))
+
+  const body = speech?.text?.trim() ? speech : null
+  if (body) {
+    pushStep({
       kind: 'judge',
-      text,
+      text: speechIntroText(body),
       voice: judgeVoice.value,
-      key: `judge-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-      highlightPlayerId: null,
+      key: `intro-${speechKey(body)}`,
+      highlightPlayerId: body.playerId,
+      patch: null,
     })
   }
-  void drainPlayQueue()
+
+  let bodyQueued = !body
+  for (const item of fresh) {
+    const isSpeechLog = SPEECH_LOG_RE.test(item.msg)
+    if (isSpeechLog && !bodyQueued) {
+      bodyQueued = true
+      pushStep({
+        kind: 'speech',
+        text: body!.text,
+        voice: voiceForPlayer(body!.playerId),
+        key: speechKey(body!),
+        highlightPlayerId: body!.playerId,
+        // 发言正文和它的战报，念到才出现在面板上
+        patch: (prev) => {
+          const idx = prev.speechQueue.indexOf(body!.playerId)
+          return {
+            speeches: nextGame.speeches,
+            logs: revealLogs(item),
+            speechIndex: idx >= 0 ? idx + 1 : prev.speechIndex,
+          }
+        },
+      })
+      continue
+    }
+    // 别的发言正文由各自的发言步落地，这里只播流程播报
+    if (isSpeechLog) continue
+    pushStep({
+      kind: 'judge',
+      text: item.msg,
+      voice: judgeVoice.value,
+      key: stepId('judge'),
+      highlightPlayerId: null,
+      patch: () => ({ logs: revealLogs(item) }),
+    })
+  }
+
+  if (!bodyQueued) {
+    // 战报里没找到对应正文（不该发生）：仍要把发言播出来
+    pushStep({
+      kind: 'speech',
+      text: body!.text,
+      voice: voiceForPlayer(body!.playerId),
+      key: speechKey(body!),
+      highlightPlayerId: body!.playerId,
+      patch: () => ({ speeches: nextGame.speeches }),
+    })
+  }
+
+  pushStep({
+    kind: 'silent',
+    text: '',
+    voice: judgeVoice.value,
+    key: stepId('commit'),
+    highlightPlayerId: null,
+    patch: () => ({ ...nextGame }),
+  })
+
+  void drainTimeline()
 }
 
+/** 唯一推进展示状态的入口 */
+function applyStepPatch(step: TimelineStep) {
+  if (!step.patch || !game.value) return
+  game.value = { ...game.value, ...step.patch(game.value) }
+}
+
+async function playStep(step: TimelineStep, epoch: number) {
+  voicePlaying.value = true
+  playingSpeechKey.value = step.key
+  try {
+    const audioData = await step.audioReady
+    if (epoch !== timelineEpoch) return
+    await ttsService.playBuffered(step.text, audioData, {
+      voice: step.voice,
+      speed: ttsSpeed.value,
+    })
+  } catch (e) {
+    console.error(e)
+  } finally {
+    if (playingSpeechKey.value === step.key) {
+      voicePlaying.value = false
+      playingSpeechKey.value = null
+    }
+  }
+}
+
+async function drainTimeline() {
+  if (timelineRunning.value) return
+  timelineRunning.value = true
+  const epoch = timelineEpoch
+  try {
+    while (timeline.value.length > 0) {
+      if (epoch !== timelineEpoch) break
+      const step = timeline.value.shift()!
+      applyStepPatch(step)
+      if (step.kind === 'silent') continue
+      playbackSpeakerId.value = step.highlightPlayerId
+      await playStep(step, epoch)
+      if (epoch !== timelineEpoch) break
+      playbackSpeakerId.value = null
+      await sleep(STEP_GAP_MS)
+    }
+  } finally {
+    if (epoch === timelineEpoch) {
+      timelineRunning.value = false
+      if (timeline.value.length > 0) void drainTimeline()
+    }
+  }
+}
+
+/** 手动朗读某条发言；自动播报进行中不插播，否则会打断队列里那一段 */
 async function playSpeechText(text: string, playerId: number, key: string) {
   if (!text?.trim()) return
   if (playingSpeechKey.value === key && voicePlaying.value) {
@@ -720,6 +769,7 @@ async function playSpeechText(text: string, playerId: number, key: string) {
     playingSpeechKey.value = null
     return
   }
+  if (timelinePending.value) return
 
   ttsService.stopPlay()
   voicePlaying.value = true
@@ -739,112 +789,10 @@ async function playSpeechText(text: string, playerId: number, key: string) {
   }
 }
 
-async function playQueuedItem(item: QueuePlayItem, epoch: number) {
-  voicePlaying.value = true
-  playingSpeechKey.value = item.key
-  try {
-    const audioData = await item.audioReady
-    if (epoch !== playPipelineEpoch) return
-    await ttsService.playBuffered(item.text, audioData, {
-      voice: item.voice,
-      speed: ttsSpeed.value,
-    })
-  } catch (e) {
-    console.error(e)
-  } finally {
-    if (playingSpeechKey.value === item.key) {
-      voicePlaying.value = false
-      playingSpeechKey.value = null
-    }
-  }
-}
-
-async function drainPlayQueue() {
-  if (playPipelineRunning.value) return
-  playPipelineRunning.value = true
-  const epoch = playPipelineEpoch
-  try {
-    while (speechPlayQueue.value.length > 0) {
-      if (epoch !== playPipelineEpoch) break
-      const item = speechPlayQueue.value.shift()!
-      if (item.kind === 'phase_commit') {
-        if (item.commitGame) applyPhaseCommit(item.commitGame)
-        continue
-      }
-      playbackSpeakerId.value = item.highlightPlayerId
-      await playQueuedItem(item, epoch)
-      if (epoch !== playPipelineEpoch) break
-      playbackSpeakerId.value = null
-    }
-  } finally {
-    if (epoch === playPipelineEpoch) {
-      playPipelineRunning.value = false
-      if (speechPlayQueue.value.length > 0) {
-        void drainPlayQueue()
-      }
-    }
-  }
-}
-
-/** 先播「N号玩家发言」，再播正文；文本一到立刻预取 */
-function enqueueSpeechPlay(speech: Speech) {
-  if (!speech?.text?.trim()) return
-  const key = speechKey(speech)
-  const intro = speechIntroText(speech)
-  pushQueueItem({
-    kind: 'judge',
-    text: intro,
-    voice: judgeVoice.value,
-    key: `intro-${key}`,
-    highlightPlayerId: speech.playerId,
-  })
-  pushQueueItem({
-    kind: 'speech',
-    text: speech.text,
-    voice: voiceForPlayer(speech.playerId),
-    key,
-    highlightPlayerId: speech.playerId,
-  })
-  void drainPlayQueue()
-}
-
-/**
- * 发言接口返回：文本立刻缓存。
- * 展示 phase 仍落后于播放时只合并内容；同阶段则可同步 speechIndex。
- * 阶段切走时走 applyGameWithVoice（法官词 + phase_commit）。
- */
-function applySpeechProgress(nextGame: GameState, stillSpeechPhase: boolean) {
-  prefetchGame.value = nextGame
-  const prevLogs = game.value?.logs ?? []
-  const judgeLines = newFlowLogMessages(prevLogs, nextGame.logs)
-
-  if (stillSpeechPhase) {
-    if (!game.value || game.value.phase === nextGame.phase || !autoVoice.value) {
-      // 展示已进入本发言阶段（或未开朗读）：可同步进度
-      game.value = nextGame
-    } else {
-      // 仍在播上一阶段（如夜间），只缓存发言正文，不抢先改 phase
-      game.value = mergeGameContent(game.value, nextGame)
-    }
-    if (autoVoice.value && judgeLines.length) {
-      enqueueJudgeLines(judgeLines)
-    }
-    return
-  }
-
-  applyGameWithVoice(nextGame, judgeLines)
-}
-
 async function nextSpeech() {
   if (speaking.value || loading.value) return
   const g = logicalGame()
-  if (!g) return
-
-  // 自动预取跟服务端阶段；手动操作跟当前展示阶段
-  const canSpeak = autoPlay.value || autoSpeak.value
-    ? SPEECH_PHASES.has(g.phase)
-    : isSpeechPhase.value
-  if (!canSpeak) return
+  if (!g || !SPEECH_PHASES.has(g.phase)) return
 
   speaking.value = true
   error.value = ''
@@ -853,37 +801,7 @@ async function nextSpeech() {
       game: GameState
       speech?: Speech
     }>(`/api/werewolf/games/${g.id}/speak`)
-
-    const stillSpeechPhase = SPEECH_PHASES.has(data.game.phase)
-    prefetchGame.value = data.game
-
-    if (autoVoice.value && data.speech?.text) {
-      // 文本 + TTS 预取入队；连发时继续请求下一位（播放与请求并行）
-      enqueueSpeechPlay(data.speech)
-      applySpeechProgress(data.game, stillSpeechPhase)
-      speaking.value = false
-      if (autoSpeak.value && stillSpeechPhase) {
-        await nextSpeech()
-      } else if (!stillSpeechPhase) {
-        autoSpeak.value = false
-      }
-      return
-    }
-
-    const prevLogs = game.value?.logs ?? g.logs
-    const lines = newFlowLogMessages(prevLogs, data.game.logs)
-    if (stillSpeechPhase) {
-      applySpeechProgress(data.game, true)
-    } else {
-      applyGameWithVoice(data.game, lines)
-    }
-
-    if (autoSpeak.value && SPEECH_PHASES.has(data.game.phase)) {
-      speaking.value = false
-      await nextSpeech()
-      return
-    }
-    autoSpeak.value = false
+    enqueueServerUpdate(data.game, data.speech)
   } catch (e) {
     error.value = errMsg(e)
     stopAutoPlay()
@@ -898,14 +816,11 @@ async function runVote() {
   if (g.phase !== 'sheriff_vote' && g.phase !== 'day_vote') return
   loading.value = true
   error.value = ''
-  autoSpeak.value = false
   try {
-    const prevLogs = game.value?.logs ?? g.logs
     const { data } = await axios.post<{ game: GameState }>(
       `/api/werewolf/games/${g.id}/vote`,
     )
-    const lines = newFlowLogMessages(prevLogs, data.game.logs)
-    applyGameWithVoice(data.game, lines)
+    enqueueServerUpdate(data.game)
   } catch (e) {
     error.value = errMsg(e)
     stopAutoPlay()
@@ -914,12 +829,19 @@ async function runVote() {
   }
 }
 
-/** 只等 API 空闲；播放可并行，内容预取不阻塞 */
-async function waitForPrefetchIdle(token: number): Promise<boolean> {
+/**
+ * 等一个可以发请求的档口：接口空闲，且待播语音没堆积。
+ * 留一点缓冲让语音不断档，但不让请求把整局跑到语音前面去。
+ */
+async function waitForPrefetchSlot(token: number): Promise<boolean> {
   for (;;) {
-    if (!autoPlay.value || token !== autoPlayToken) return false
-    if (loading.value || speaking.value) {
-      await sleep(80)
+    if (token !== autoPlayToken) return false
+    if (
+      loading.value ||
+      speaking.value ||
+      pendingAudioSteps.value > PREFETCH_AHEAD_LIMIT
+    ) {
+      await sleep(120)
       continue
     }
     return true
@@ -930,18 +852,14 @@ async function runAutoPlayLoop() {
   const token = ++autoPlayToken
   autoPlay.value = true
   while (autoPlay.value && token === autoPlayToken) {
-    const idle = await waitForPrefetchIdle(token)
-    if (!idle) break
+    if (!(await waitForPrefetchSlot(token))) break
+    if (!autoPlay.value || token !== autoPlayToken) break
 
     const g = logicalGame()
     if (!g || g.phase === 'ended') {
-      // 终局：若仍有播报在播，等队列自然播完即可
-      if (
-        speechPlayQueue.value.length > 0 ||
-        playPipelineRunning.value ||
-        voicePlaying.value
-      ) {
-        await sleep(80)
+      // 终局：等剩下的播报自然播完再收工
+      if (timelinePending.value || voicePlaying.value) {
+        await sleep(120)
         continue
       }
       stopAutoPlay()
@@ -954,7 +872,6 @@ async function runAutoPlayLoop() {
     }
 
     if (SPEECH_PHASES.has(g.phase)) {
-      autoSpeak.value = true
       await nextSpeech()
       continue
     }
@@ -967,6 +884,22 @@ async function runAutoPlayLoop() {
     stopAutoPlay()
     break
   }
+}
+
+/** 只连发言、不接管夜/投票 */
+async function runAutoSpeakLoop() {
+  const token = ++autoPlayToken
+  autoSpeak.value = true
+  while (autoSpeak.value && token === autoPlayToken) {
+    if (!(await waitForPrefetchSlot(token))) break
+    if (!autoSpeak.value || token !== autoPlayToken) break
+
+    const g = logicalGame()
+    if (!g || !SPEECH_PHASES.has(g.phase)) break
+    await nextSpeech()
+    if (error.value) break
+  }
+  if (token === autoPlayToken) autoSpeak.value = false
 }
 
 async function toggleAutoPlay() {
@@ -986,25 +919,25 @@ async function startGameAuto() {
 }
 
 async function toggleAutoSpeak() {
-  if (autoPlay.value) {
+  if (autoPlay.value || autoSpeak.value) {
     stopAutoPlay()
     return
   }
-  autoSpeak.value = !autoSpeak.value
-  if (autoSpeak.value) {
-    await nextSpeech()
-  }
+  await runAutoSpeakLoop()
 }
 
+/** 关掉朗读时把剩下的播报丢掉，状态直接追平到已请求的进度 */
+watch(autoVoice, (on) => {
+  if (!on) clearTimeline({ applyPending: true })
+})
+
 function resetLocal() {
-  ttsService.stopPlay()
+  stopAutoPlay()
+  clearTimeline()
+  narratedLogKeys.clear()
   game.value = null
   prefetchGame.value = null
   error.value = ''
-  stopAutoPlay()
-  voicePlaying.value = false
-  playingSpeechKey.value = null
-  clearSpeechPipeline()
 }
 
 function roleClass(p: Player) {
@@ -1296,10 +1229,10 @@ function speechKindTag(kind?: SpeechKind) {
           v-if="game.phase === 'night'"
           class="btn primary"
           type="button"
-          :disabled="loading || autoPlay || hasPendingPhaseCommit"
+          :disabled="loading || autoPlay || timelinePending"
           @click="runNight"
         >
-          {{ loading ? '结算中…' : hasPendingPhaseCommit ? '播报中…' : '结算夜晚' }}
+          {{ loading ? '结算中…' : timelinePending ? '播报中…' : '结算夜晚' }}
         </button>
 
         <template v-if="isSpeechPhase">
@@ -1312,8 +1245,7 @@ function speechKindTag(kind?: SpeechKind) {
               voicePlaying ||
               autoSpeak ||
               autoPlay ||
-              playPipelineRunning ||
-              speechPlayQueue.length > 0 ||
+              timelinePending ||
               currentSpeakerId == null
             "
             @click="nextSpeech"
@@ -1357,15 +1289,10 @@ function speechKindTag(kind?: SpeechKind) {
           </select>
         </label>
         <button
-          v-if="voicePlaying || speechPlayQueue.length > 0"
+          v-if="voicePlaying || timelinePending"
           class="btn"
           type="button"
-          @click="
-            ttsService.stopPlay();
-            voicePlaying = false;
-            playingSpeechKey = null;
-            clearSpeechPipeline({ applyPending: true })
-          "
+          @click="clearTimeline({ applyPending: true })"
         >
           停止朗读
         </button>
@@ -1374,10 +1301,10 @@ function speechKindTag(kind?: SpeechKind) {
           v-if="isVotePhase"
           class="btn primary"
           type="button"
-          :disabled="loading || autoPlay || hasPendingPhaseCommit"
+          :disabled="loading || autoPlay || timelinePending"
           @click="runVote"
         >
-          {{ hasPendingPhaseCommit ? '播报中…' : voteButtonLabel }}
+          {{ timelinePending ? '播报中…' : voteButtonLabel }}
         </button>
       </section>
 
@@ -1471,6 +1398,7 @@ function speechKindTag(kind?: SpeechKind) {
                     class="btn-speak"
                     type="button"
                     :class="{ active: playingSpeechKey === speechKey(s) }"
+                    :disabled="timelinePending"
                     :title="playingSpeechKey === speechKey(s) ? '停止' : '朗读'"
                     @click="playSpeechText(s.text, s.playerId, speechKey(s))"
                   >

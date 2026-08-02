@@ -33,6 +33,27 @@ export const ROLE_CN = {
   idiot: "白痴",
 };
 
+/** 发言模型 id → 战报/朗读用中文名 */
+const MODEL_CN = {
+  doubao: "豆包",
+  deepseek: "DeepSeek",
+  openai: "OpenAI",
+  tongyiqwen: "通义千问",
+  ai21: "AI21",
+  anthropic: "Anthropic",
+  baiduqianfan: "文心一言",
+  googlegemini: "Gemini",
+  chatwriter: "ChatWriter",
+  azureopenai: "Azure OpenAI",
+  chatollama: "Ollama",
+  mixed: "混合",
+};
+
+function modelLabel(modelId) {
+  if (!modelId) return "豆包";
+  return MODEL_CN[modelId] || modelId;
+}
+
 export const CAMP = {
   EVIL: "evil",
   GOOD: "good",
@@ -387,7 +408,7 @@ export function createGame(options = {}) {
   };
 
   const modelSummary = players
-    .map((p) => `${p.id}号=${p.modelId}`)
+    .map((p) => `${p.id}号${modelLabel(p.modelId)}`)
     .join("，");
   pushLog(
     game,
@@ -687,8 +708,8 @@ export function resolveNight(game) {
     ? AFTER_LAST_WORDS.SHERIFF
     : AFTER_LAST_WORDS.DAY;
 
-  // 夜间死亡（刀/毒）→ 先发表遗言，再进入警长竞选或白天发言
-  if (deaths.length > 0) {
+  // 仅首夜出局玩家有遗言；第二夜起直接进入白天流程
+  if (deaths.length > 0 && game.night === 1) {
     startLastWords(
       game,
       deaths.map((d) => d.id),
@@ -698,7 +719,7 @@ export function resolveNight(game) {
     return { events, deaths, hunterShot: null };
   }
 
-  // 平安夜：若有猎人开枪（理论上夜间死亡才会触发），仍先处理
+  // 平安夜或第二夜起有人出局：若猎人待开枪，先处理
   const hunterShot = resolvePendingHunterShot(game);
   if (game.phase === PHASE.ENDED) {
     return { events, deaths, hunterShot };
@@ -1422,13 +1443,10 @@ export function resolveVote(game) {
     role: exiled.role,
     roleCn: ROLE_CN[exiled.role],
   };
-  pushLog(
-    game,
-    `${exiled.id} 号被放逐，身份是【${ROLE_CN[exiled.role]}】。`,
-  );
+  pushLog(game, `${exiled.id} 号被放逐出局。`);
   pushPublicHistory(
     game,
-    `第${game.day}天放逐：${exiled.id}号出局，身份【${ROLE_CN[exiled.role]}】。票型：${detailText || "无"}。`,
+    `第${game.day}天放逐：${exiled.id}号出局。票型：${detailText || "无"}。`,
   );
 
   if (exiled.id === game.sheriffId) {
